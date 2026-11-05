@@ -13,18 +13,21 @@ cordis.patch.yml    inserts row id `game-lab`, name @local/game-lab, with config
 index.js            host entry: `inject: ['webServer']`, mounts GameLab + routes
 host/emulator.js    GameLab controller: AVD lifecycle, adb, input, install, build
 host/frame.js       in-process PNG frame pipeline + multipart writer
+host/video.js       screenrecord H.264 process + NAL statistics
+host/build.js       build-plan detection: Gradle vs Capacitor pipelines
 host/routes.js      /_dsh/game-lab/* HTTP routes and the loopback/origin fence
 host/library.js     APK/Gradle-project scanner, aapt2 metadata, grouping
 client.js           the whole page: plain-JS React, sidebar icon + main page
 locale/*.json       Plugin Manager display metadata (en, zh)
 icon.svg            original gamepad artwork
-test/*.mjs          node --test suites (frame, fence, integration, library, locale keys)
+test/*.mjs          node --test suites (frame, fence, video, integration, library, locale keys)
 ```
 
 `client.js` and `host/*.js` are plain ESM/script files with no bundler and no
 npm dependencies. `node --check` must pass on all of them; the tests run with
-`node --test test/frame.test.mjs test/fence.test.mjs test/integration.test.mjs
-host/library.test.mjs` from the plugin directory (44 assertions, ~1 s).
+`node --test test/frame.test.mjs test/fence.test.mjs test/video.test.mjs
+test/integration.test.mjs host/library.test.mjs` from the plugin directory
+(25 tests, ~1.5 s).
 
 ## Host lifecycle
 
@@ -75,15 +78,60 @@ demand deadline; `#tickFrames` stops the loop when there are no consumers and
 the deadline passed (60 s after the last reader). This is what keeps CPU near
 zero when the page is hidden even if the emulator must stay up.
 
+## Smooth live view (`host/video.js`)
+
+A second, independent source runs one persistent
+`adb exec-out screenrecord --output-format=h264 --bit-rate 6000000
+--time-limit 180 -` child and fans its raw Annex-B bytes out to the single
+`GET /stream.h264` viewer. The page parses SPS/PPS/VCL NALs, builds the
+WebCodecs `avc1.<profile><constraints><level>` string from the SPS, feeds each
+VCL NAL as one `EncodedVideoChunk` (SPS+PPS included on keyframes) and draws
+decoded `VideoFrame`s to a canvas. The PNG stream remains the fallback and the
+"Compat" mode.
+
+Measured behaviour and traps:
+- **Frames only flow when the picture changes.** A static game/menu can emit
+  one frame for many seconds while fast scrolling emitted 114 frames in 6 s
+  (~19 fps) - this is MediaCodec/surface behaviour, not a plugin bug. That is
+  why low fps on a static screen is fine, but a "1 fps" label on its own is
+  misleading.
+- **Never end the HTTP response when one `res.write()` returns false.** A
+  20 KB SPS+IDR chunk exceeds the 16 KB high-water mark on every stream; the
+  first implementation treated `false` as a dead socket and closed after the
+  first keyframe (curl received exactly ~21 KB). Node buffers the rest; only a
+  genuinely stuck client (8 MB queued `writableLength`) is cut off.
+- **One viewer, fresh encoder.** `/stream.h264` rejects a second viewer with
+  409 and stops any old loop before starting, so the decoder always begins at
+  SPS/PPS + IDR. The page retries a 409 briefly.
+- **The time limit is real.** `screenrecord` stops at 180 s; `VideoLoop.onExit`
+  restarts it after 800 ms and the still-open response keeps streaming (new
+  SPS/PPS + keyframe, which the client handles).
+- **The display must stay awake.** A sleeping screen freezes games and
+  `screenrecord` alike. `#prepareDevice()` runs `svc power stayon true`,
+  sets an effectively infinite `screen_off_timeout`, dismisses the keyguard and
+  sends WAKEUP after every boot/adopt (verified: `mStayOn=true`,
+  `mWakefulness=Awake`).
+- **Validate H.264 with ffmpeg, trimming the trailing NAL of an aborted
+  capture.** Aborting a live capture cuts the last NAL and ffmpeg reports
+  "Invalid level prefix"/decode errors at the tail; after dropping the last
+  partial NAL the same file decoded 22/22 frames cleanly. Do not report a
+  stream corrupt from tail errors alone.
+- CPU/RAM: screenrecord runs on the guest's encoder; the host cost is the adb
+  pipe plus node fan-out, and stats are ~19 fps / 0.1-1.0 Mbps in normal use.
+
+
+
 ## Input
 
 Coordinates are normalized 0..1 of the current frame and converted with the
 latest frame dimensions (fallback `wm size`); the client does the same
-letterbox math from the `<img>` object-fit box, so the two agree for portrait
-and landscape. Keys map to `KEYCODE_*`; text is ASCII-only (`input text`,
-spaces as `%s`) because there is no ADBKeyboard installation. `rotate` sets
-`accelerometer_rotation 0` + `user_rotation`; a manifest-locked landscape game
-ignores it, which is correct Android behaviour.
+letterbox math from the `<img>`/`<canvas>` object-fit box, so the two agree for
+portrait and landscape. Keys map to `KEYCODE_*` (including space, escape, tab
+and the D-pad); text is ASCII-only (`input text`, spaces as `%s`) because there
+is no ADBKeyboard installation. The page's **Keyboard** panel sends typed text
+plus Enter/Space/Backspace/Esc. `rotate` sets `accelerometer_rotation 0` +
+`user_rotation`; a manifest-locked landscape game ignores it, which is correct
+Android behaviour.
 
 ## Install / launch / build
 
@@ -98,19 +146,27 @@ that (install OK, launcher still foreground). `#launchPackage` now checks the
 throws if both fail, so `/install` cannot report `launched: true` for a launch
 that did not happen.
 
-`buildProject` runs `<project>/gradlew.bat assembleDebug --console=plain`
-through `cmd /c` in the project directory (JAVA_HOME inherited,
-`ANDROID_HOME` from the resolved SDK), keeps the last 400 log lines, then finds
-the newest `*.apk` under `build/outputs` produced after the build started and
-installs+launches it. A fully up-to-date Gradle run writes **no** APK, so when
-no fresh file exists the installer falls back to the newest existing APK under
-`build/outputs` and logs that it did so (the first build test failed with
-"no new APK" before this fallback; the retry succeeded: build 2 s, install and
-launch confirmed in the foreground). If the emulator is off when a build is
-requested, the plugin starts it in parallel and waits up to 150 s for it before
-the install step, so "Build & play" is one click. The idle timer must not stop
-the emulator while a build is running (a build can outlast `idleMinutes`); that
-is enforced in `#tickIdle`.
+`buildProject` now asks `host/build.js` for a plan instead of assuming Gradle.
+Detection walks from the selected project (usually `<app>/android`) up to the
+JavaScript app root, reads `package.json`/Capacitor config, and returns ordered
+steps plus the places to look for the APK:
+- plain Gradle: `gradlew assembleDebug`;
+- Capacitor with an `android:apk` script (Gravebound): run exactly
+  `npm run android:apk` - the project's own web build + `cap sync` + Gradle;
+- Capacitor without it (Little Lanterns): `npm run build`,
+  `npx --no-install cap sync android`, then `gradlew assembleDebug`.
+A generic `#runBuildStep` spawns each step through `cmd /c` (or `sh -c`),
+captures up to 500 log lines, enforces a 12-minute per-step timeout, and
+reports `phase`, `stepIndex` and `kind` in `/status`, which the page renders.
+The old "run `gradlew` only" path installed stale web assets for Capacitor
+games, so this is a correctness fix, not just convenience. A fully up-to-date
+build writes no APK; the installer falls back to the newest existing APK under
+the plan's search roots and logs that it did so. If the emulator is off, the
+plugin boots it in parallel and waits (up to 150 s) before installing, so
+"Build & play" is one click; `#tickIdle` never stops the emulator while a build
+is running. Verified live on `gravebound/android`: detected `capacitor`, one
+`project` step, `BUILD SUCCESSFUL in 37 s`, app installed and launched,
+71.4 s total from emulator-off.
 
 ## Library scanner (`host/library.js`)
 
@@ -182,7 +238,16 @@ PowerShell is unavailable the readouts stay null; nothing else depends on it.
   `emu kill`; it is the shutdown helper, not a second emulator.
 - Another session on the same machine can hold adb/emulator state (this box
   runs multiple agents). Adopt an existing online emulator instead of booting
-  another, and never kill emulators or processes you did not start.
+  another, and never kill emulators or processes you did not start. Idle
+  Gradle/Kotlin daemons can hold several GB; they are compiler daemons, not
+  user apps, and stop/restart cheaply if the machine needs RAM for the
+  emulator.
+- `screenrecord` writes frames only when the display content changes; do not
+  measure its frame rate on a static menu. Use a scrolling app/game for a
+  representative number.
+- Do not treat `res.write() === false` on the H.264 route as a dead client
+  (see the smooth-view section); it is normal backpressure and must be
+  buffered, not fatal.
 - A DSH restart/profile repair can reset the profile's `dsh.profile.bundles`
   list to only the base bundles while the packages stay linked. The plugin then
   disappears (404 on its routes) until the bundle is re-selected

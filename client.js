@@ -75,6 +75,13 @@ window.__ModuleLoader__.load({
       'device.start': 'Start Game Lab',
       'device.retrying': 'Reconnecting to the live view...',
       'device.tapHint': 'Tap to tap - drag to swipe',
+      'view.smooth': 'Smooth',
+      'view.compat': 'Compat',
+      'view.smoothTitle': 'High-frame-rate live view (H.264)',
+      'view.compatTitle': 'Compatibility view (PNG, about 1 fps)',
+      'view.fallback': 'Smooth view could not start - switched to compatibility mode.',
+      'view.connecting': 'Connecting smooth view...',
+      'view.fps': '{n} fps',
       'device.back': 'Back',
       'device.home': 'Home',
       'device.recents': 'Recents',
@@ -186,6 +193,20 @@ window.__ModuleLoader__.load({
       'build.done': 'Build finished - the APK is in the library.',
       'build.failed': 'The build failed - check the log output.',
       'build.requestFailed': 'Could not start the build.',
+      'build.phase': 'Step {i}/{n} - {phase}',
+      'build.kindCapacitor': 'Capacitor app: web build + cap sync + Gradle',
+      'build.kindGradle': 'Gradle project',
+
+      'kb.toggle': 'Keyboard',
+      'kb.title': 'Type into the game',
+      'kb.placeholder': 'Text for the focused field in the game',
+      'kb.send': 'Send',
+      'kb.enter': 'Enter',
+      'kb.space': 'Space',
+      'kb.backspace': 'Backspace',
+      'kb.esc': 'Esc',
+      'kb.hint': 'ASCII only. Tap the game input field first, then send.',
+      'kb.sent': 'Text sent.',
 
       'banner.dismiss': 'Dismiss message',
 
@@ -391,6 +412,273 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ */
+    /* H.264 live view (WebCodecs)                                         */
+    /* ------------------------------------------------------------------ */
+
+    const VIEW_MODE_KEY = 'dsh.game-lab.viewMode';
+
+    function readViewMode() {
+      try {
+        return window.localStorage.getItem(VIEW_MODE_KEY) === 'png' ? 'png' : 'auto';
+      } catch (error) {
+        return 'auto';
+      }
+    }
+
+    function writeViewMode(mode) {
+      try {
+        window.localStorage.setItem(VIEW_MODE_KEY, mode === 'png' ? 'png' : 'auto');
+      } catch (error) {
+        /* persistence is best effort */
+      }
+    }
+
+    function concatBytes(parts) {
+      let length = 0;
+      for (let i = 0; i < parts.length; i += 1) length += parts[i].length;
+      const out = new Uint8Array(length);
+      let offset = 0;
+      for (let i = 0; i < parts.length; i += 1) {
+        out.set(parts[i], offset);
+        offset += parts[i].length;
+      }
+      return out;
+    }
+
+    /** Split an Annex-B byte stream into NAL units, kept complete across chunks. */
+    function createNalReader(onNal) {
+      let buffer = new Uint8Array(0);
+      return {
+        push(chunk) {
+          if (!chunk || chunk.length === 0) return;
+          const merged = new Uint8Array(buffer.length + chunk.length);
+          merged.set(buffer, 0);
+          merged.set(chunk, buffer.length);
+          const starts = [];
+          for (let i = 0; i + 3 < merged.length; i += 1) {
+            if (merged[i] === 0 && merged[i + 1] === 0 && merged[i + 2] === 1) {
+              starts.push(i);
+              i += 2;
+            }
+          }
+          for (let s = 0; s < starts.length - 1; s += 1) {
+            const start = starts[s];
+            const end = starts[s + 1];
+            if (end - start > 3) onNal(merged.subarray(start, end));
+          }
+          if (starts.length > 0) buffer = merged.slice(starts[starts.length - 1]);
+          else if (merged.length <= 8 * 1024 * 1024) buffer = merged;
+          else buffer = new Uint8Array(0);
+        },
+        reset() {
+          buffer = new Uint8Array(0);
+        },
+      };
+    }
+
+    function nalPayloadOffset(nal) {
+      if (nal.length > 4 && nal[0] === 0 && nal[1] === 0 && nal[2] === 0 && nal[3] === 1) return 4;
+      if (nal.length > 3 && nal[0] === 0 && nal[1] === 0 && nal[2] === 1) return 3;
+      return 0;
+    }
+
+    function nalTypeOf(nal) {
+      const offset = nalPayloadOffset(nal);
+      return offset === 0 || nal.length <= offset ? 0 : nal[offset] & 0x1f;
+    }
+
+    function hexByte(value) {
+      return (value < 16 ? '0' : '') + value.toString(16);
+    }
+
+    /** Build the WebCodecs codec string from an SPS NAL (profile/constraints/level). */
+    function codecFromSps(nal) {
+      const offset = nalPayloadOffset(nal);
+      if (offset === 0 || nal.length < offset + 4) return null;
+      return 'avc1.' + hexByte(nal[offset]) + hexByte(nal[offset + 1]) + hexByte(nal[offset + 2]);
+    }
+
+    /**
+     * Decode the host's `/stream.h264` into a canvas. Returns the canvas ref and
+     * live state; a fatal error calls `onFatal`, where the page falls back to
+     * the PNG compatibility view.
+     */
+    function useH264View(enabled, onFatal) {
+      const canvasRef = useRef(null);
+      const [state, setState] = useState({ status: 'idle', fps: 0, width: 0, height: 0, error: null });
+      const fatalRef = useRef(onFatal);
+      fatalRef.current = onFatal;
+
+      useEffect(() => {
+        if (!enabled) {
+          setState({ status: 'idle', fps: 0, width: 0, height: 0, error: null });
+          return undefined;
+        }
+        if (typeof window === 'undefined' || typeof window.VideoDecoder !== 'function') {
+          setState({ status: 'unsupported', fps: 0, width: 0, height: 0, error: null });
+          return undefined;
+        }
+        const canvas = canvasRef.current;
+        if (!canvas) return undefined;
+        const context = canvas.getContext('2d');
+        let cancelled = false;
+        let decoder = null;
+        let configured = null;
+        let sps = null;
+        let pps = null;
+        let timestamp = 0;
+        let fpsMark = Date.now();
+        let fpsFrames = 0;
+        let reader = null;
+        const controller = new AbortController();
+
+        const fail = (message) => {
+          if (cancelled) return;
+          cancelled = true;
+          try {
+            controller.abort();
+          } catch (error) {
+            /* already aborted */
+          }
+          setState({ status: 'error', fps: 0, width: 0, height: 0, error: message });
+          if (fatalRef.current) fatalRef.current(message);
+        };
+
+        const configure = (codec) => {
+          if (decoder !== null && configured === codec) return;
+          if (decoder !== null) {
+            try {
+              decoder.close();
+            } catch (error) {
+              /* already closed */
+            }
+            decoder = null;
+          }
+          decoder = new window.VideoDecoder({
+            output(frame) {
+              try {
+                if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+                if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+                context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                fpsFrames += 1;
+              } finally {
+                frame.close();
+              }
+            },
+            error(error) {
+              fail('Decoder: ' + (error && error.message ? error.message : String(error)));
+            },
+          });
+          decoder.configure({ codec: codec, optimizeForLatency: true });
+          configured = codec;
+        };
+
+        const nalReader = createNalReader((nal) => {
+          if (cancelled) return;
+          const type = nalTypeOf(nal);
+          if (type === 7) {
+            sps = nal;
+            return;
+          }
+          if (type === 8) {
+            pps = nal;
+            return;
+          }
+          if (type !== 1 && type !== 5) return;
+          const codec = sps === null ? null : codecFromSps(sps);
+          if (codec === null) return;
+          try {
+            configure(codec);
+          } catch (error) {
+            fail('Decoder setup: ' + (error && error.message ? error.message : String(error)));
+            return;
+          }
+          const isKey = type === 5;
+          const parts = isKey && pps !== null ? [sps, pps, nal] : [nal];
+          timestamp += 33333;
+          try {
+            decoder.decode(new window.EncodedVideoChunk({
+              type: isKey ? 'key' : 'delta',
+              timestamp,
+              data: concatBytes(parts),
+            }));
+          } catch (error) {
+            fail('Decode: ' + (error && error.message ? error.message : String(error)));
+          }
+        });
+
+        setState({ status: 'connecting', fps: 0, width: 0, height: 0, error: null });
+        (async () => {
+          try {
+            let response = null;
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              response = await fetch(API + '/stream.h264?_=' + String(Date.now()), {
+                cache: 'no-store',
+                signal: controller.signal,
+              });
+              if (response.status === 409 && attempt < 2) {
+                await new Promise((resolve) => window.setTimeout(resolve, 450));
+                continue;
+              }
+              break;
+            }
+            if (response === null || !response.ok || response.body === null) {
+              throw new Error('HTTP ' + (response === null ? '?' : String(response.status)));
+            }
+            setState({ status: 'live', fps: 0, width: 0, height: 0, error: null });
+            reader = response.body.getReader();
+            for (;;) {
+              const chunk = await reader.read();
+              if (cancelled) break;
+              if (chunk.done) break;
+              if (chunk.value) nalReader.push(chunk.value);
+            }
+            if (!cancelled) fail('The smooth stream ended.');
+          } catch (error) {
+            if (!cancelled && error && error.name !== 'AbortError') {
+              fail(error && error.message ? error.message : String(error));
+            }
+          }
+        })();
+
+        const statTimer = window.setInterval(() => {
+          if (cancelled) return;
+          const now = Date.now();
+          const elapsed = Math.max(1, now - fpsMark);
+          const fps = Math.round((fpsFrames / elapsed) * 10000) / 10;
+          fpsFrames = 0;
+          fpsMark = now;
+          setState((previous) => previous.status === 'live'
+            ? Object.assign({}, previous, { fps: fps, width: canvas.width, height: canvas.height })
+            : previous);
+        }, 1000);
+
+        return () => {
+          cancelled = true;
+          window.clearInterval(statTimer);
+          try {
+            controller.abort();
+          } catch (error) {
+            /* already aborted */
+          }
+          if (reader !== null) {
+            reader.cancel().catch(() => {});
+          }
+          if (decoder !== null) {
+            try {
+              decoder.close();
+            } catch (error) {
+              /* already closed */
+            }
+          }
+          nalReader.reset();
+        };
+      }, [enabled]);
+
+      return { canvasRef: canvasRef, state: state };
+    }
+
+    /* ------------------------------------------------------------------ */
     /* Icons (inline SVG only)                                             */
     /* ------------------------------------------------------------------ */
 
@@ -478,6 +766,9 @@ window.__ModuleLoader__.load({
 
     const IconChevron = (props) => h(IconBase, { size: props.size }, h('path', { d: 'M6.2 3.6 10.6 8l-4.4 4.4' }));
 
+    const IconBolt = (props) =>
+      h(IconBase, { size: props.size }, h('path', { d: 'M9.2 2.4 4.4 9h3.3l-.9 4.6L11.6 7H8.3z' }));
+
     const IconGamepad = (props) => {
       const size = props.size || 20;
       return h(
@@ -502,8 +793,15 @@ window.__ModuleLoader__.load({
       );
     };
 
-    function PanelIcon({ size = 20, active = false }) {
-      const stroke = active ? 'var(--dsw-alias-brand-primary)' : 'currentColor';
+    const IconKeyboard = (props) =>
+      h(
+        IconBase,
+        { size: props.size },
+        h('rect', { x: 1.7, y: 4.4, width: 12.6, height: 7.2, rx: 1.3 }),
+        h('path', { d: 'M4.1 6.5h.01M6.4 6.5h.01M8.7 6.5h.01M11 6.5h.01M4.1 8.6h.01M11 8.6h.01M6 10.1h4' }),
+      );
+
+    function PanelIcon({ size = 20, active = false }) {      const stroke = active ? 'var(--dsw-alias-brand-primary)' : 'currentColor';
       return h(
         'svg',
         {
@@ -729,6 +1027,8 @@ window.__ModuleLoader__.load({
 .gl-buildbox { margin-top:9px; padding:8px 9px; border:1px solid var(--dsw-alias-border-l1);
   border-radius:8px; background:var(--dsw-alias-bg-layer-2); }
 .gl-buildbox[data-tone='error'] { border-color:var(--dsw-alias-state-error-primary); }
+.gl-buildphase { margin-bottom:6px; font-size:10.5px; line-height:1.4;
+  color:var(--dsw-alias-brand-primary); }
 .gl-buildbox-title { margin-bottom:5px; font-size:10.5px; letter-spacing:.04em;
   text-transform:uppercase; color:var(--dsw-alias-label-secondary); }
 .gl-buildlog, .gl-logs { max-height:180px; overflow:auto; padding:8px 9px;
@@ -790,6 +1090,16 @@ window.__ModuleLoader__.load({
 .gl-toolbar-sep { width:1px; height:16px; margin:0 3px; background:var(--dsw-alias-border-l1); }
 .gl-toolbar-hint { margin-left:auto; padding-left:8px; font-size:10.5px;
   color:var(--dsw-alias-label-secondary); white-space:nowrap; }
+.gl-tool[data-active='true'] { border-color:var(--dsw-alias-brand-primary);
+  background:var(--dsw-alias-bg-layer-2); color:var(--dsw-alias-brand-primary); }
+.gl-kb { display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:9px 12px;
+  border-top:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); }
+.gl-kb-input { flex:1 1 170px; min-width:120px; height:28px; padding:0 9px;
+  border:1px solid var(--dsw-alias-border-l2); border-radius:6px;
+  background:var(--dsw-alias-bg-base); color:var(--dsw-alias-label-primary);
+  font-size:12px; outline:none; }
+.gl-kb-input:focus { border-color:var(--dsw-alias-brand-primary); }
+.gl-kb-hint { flex-basis:100%; font-size:10.5px; color:var(--dsw-alias-label-secondary); }
 
 /* runtime readouts */
 .gl-kv { display:flex; align-items:baseline; justify-content:space-between; gap:12px;
@@ -934,19 +1244,21 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function Toolbar({ tr, online, orientation, onKey, onRotate, onScreenshot, onReload }) {
+    function Toolbar({ tr, online, orientation, onKey, onRotate, onScreenshot, onReload, keyboardOpen, onKeyboard, viewActive, onView, viewAvailable }) {
       const rotateTo = tr(orientation === 'portrait' ? 'device.landscape' : 'device.portrait');
       const rotateLabel = tr('device.rotateTo', { value: rotateTo });
-      const tool = (key, label, icon, onClick, title) =>
+      const tool = (key, label, icon, onClick, title, active) =>
         h(
           'button',
           {
             key,
             type: 'button',
             className: 'gl-tool',
+            'data-active': active ? 'true' : 'false',
             disabled: !online,
             'aria-label': title || label,
             title: title || label,
+            'aria-pressed': key === 'kb' ? (active ? 'true' : 'false') : undefined,
             onClick,
           },
           icon,
@@ -969,6 +1281,10 @@ window.__ModuleLoader__.load({
         h('span', { key: 'sep-2', className: 'gl-toolbar-sep', 'aria-hidden': true }),
         tool('shot', tr('device.screenshot'), h(IconCamera, { size: 14 }), onScreenshot),
         tool('reload', tr('device.reload'), h(IconReload, { size: 14 }), onReload),
+        viewAvailable
+          ? tool('view', tr('view.smooth'), h(IconBolt, { size: 14 }), onView, tr(viewActive ? 'view.smoothTitle' : 'view.compatTitle'), viewActive)
+          : null,
+        tool('kb', tr('kb.toggle'), h(IconKeyboard, { size: 14 }), onKeyboard, tr('kb.title'), keyboardOpen),
         h('span', { key: 'hint', className: 'gl-toolbar-hint' }, tr('device.tapHint')),
       );
     }
@@ -1283,12 +1599,30 @@ window.__ModuleLoader__.load({
               }),
             ),
           ),
-          running && build && build.logTail
+          running && build
             ? h(
                 'div',
-                { className: 'gl-buildbox' },
-                h('div', { className: 'gl-buildbox-title' }, tr('proj.log')),
-                h('pre', { className: 'gl-buildlog' }, tailText(build.logTail, BUILD_LOG_SHOWN_LINES)),
+                { className: 'gl-buildbox', 'data-tone': build.ok === false ? 'error' : undefined },
+                h(
+                  'div',
+                  { className: 'gl-buildbox-title' },
+                  tr('proj.log'),
+                  build.kind === 'capacitor' ? ' - ' + tr('build.kindCapacitor') : '',
+                ),
+                build.phase
+                  ? h(
+                      'div',
+                      { className: 'gl-buildphase' },
+                      tr('build.phase', {
+                        i: (Number(build.stepIndex) || 0) + 1,
+                        n: Number(build.stepCount) || 1,
+                        phase: build.phase,
+                      }),
+                    )
+                  : null,
+                build.logTail
+                  ? h('pre', { className: 'gl-buildlog' }, tailText(build.logTail, BUILD_LOG_SHOWN_LINES))
+                  : null,
               )
             : null,
         );
@@ -1558,6 +1892,8 @@ window.__ModuleLoader__.load({
       const [logsLoading, setLogsLoading] = useState(false);
       const [logsError, setLogsError] = useState(null);
       const [logPackage, setLogPackage] = useState('');
+      const [keyboardOpen, setKeyboardOpen] = useState(false);
+      const [keyboardText, setKeyboardText] = useState('');
       const [visible, setVisible] = useState(false);
       const [now, setNow] = useState(() => Date.now());
 
@@ -2008,6 +2344,23 @@ window.__ModuleLoader__.load({
         [emuState, post, tr],
       );
 
+      /* Type ASCII text into the focused field inside the game. */
+      const sendText = useCallback(() => {
+        const text = String(keyboardText || '');
+        if (text === '' || emuState !== 'online') return;
+        post('/input', { kind: 'text', text })
+          .then(() => {
+            if (!aliveRef.current) return;
+            setKeyboardText('');
+            setBanner({ kind: 'success', text: tr('kb.sent') });
+          })
+          .catch((error) => {
+            if (!aliveRef.current) return;
+            if (error && error.name === 'AbortError') return;
+            setBanner({ kind: 'error', text: tr('err.input') + ' ' + errorText(error, tr) });
+          });
+      }, [keyboardText, emuState, post, tr]);
+
       /* Throttle pointer input to at most ~12 posts per second. */
       const queueInput = useCallback(
         (payload) => {
@@ -2026,15 +2379,35 @@ window.__ModuleLoader__.load({
       const resolution = emulator && emulator.resolution && emulator.resolution.width > 0
         ? emulator.resolution
         : DEFAULT_RESOLUTION;
-      const orientation = resolution.width >= resolution.height ? 'landscape' : 'portrait';
+      const orientation = effectiveResolution.width >= effectiveResolution.height ? 'landscape' : 'portrait';
       const online = emuState === 'online';
       const booting = emuState === 'booting';
       const stopping = emuState === 'stopping';
       const offline = !online && !booting && !stopping;
 
+      /* Live view mode: WebCodecs H.264 when available, PNG as the fallback. */
+      const h264Available = typeof window !== 'undefined' && typeof window.VideoDecoder === 'function';
+      const [viewMode, setViewMode] = useState(readViewMode);
+      const h264Enabled = online && visible && h264Available && viewMode !== 'png';
+      const h264 = useH264View(h264Enabled, () => {
+        setViewMode('png');
+        writeViewMode('png');
+        setBanner({ kind: 'error', text: tr('view.fallback') });
+      });
+      const videoSize = h264.state.width > 0 && h264.state.height > 0
+        ? { width: h264.state.width, height: h264.state.height }
+        : null;
+      const effectiveResolution = videoSize !== null ? videoSize : resolution;
+
+      const toggleView = useCallback(() => {
+        const next = h264Enabled ? 'png' : 'auto';
+        setViewMode(next);
+        writeViewMode(next);
+      }, [h264Enabled]);
+
       const rotateScreen = useCallback(() => {
         if (!online) return;
-        const next = resolution.width >= resolution.height ? 'portrait' : 'landscape';
+        const next = effectiveResolution.width >= effectiveResolution.height ? 'portrait' : 'landscape';
         post('/input', { kind: 'rotate', orientation: next })
           .then(() => {
             if (aliveRef.current) fetchStatus();
@@ -2044,7 +2417,7 @@ window.__ModuleLoader__.load({
             if (error && error.name === 'AbortError') return;
             setBanner({ kind: 'error', text: tr('err.rotate') + ' ' + errorText(error, tr) });
           });
-      }, [online, resolution, post, fetchStatus, tr]);
+      }, [online, effectiveResolution, post, fetchStatus, tr]);
 
       const onScreenPointerDown = useCallback(
         (event) => {
@@ -2104,8 +2477,8 @@ window.__ModuleLoader__.load({
           }
           if (!gesture || gesture.id !== event.pointerId) return;
           if (emuState !== 'online' || !element) return;
-          const start = resolveScreenPoint(element, gesture.startX, gesture.startY, resolution);
-          const end = resolveScreenPoint(element, event.clientX, event.clientY, resolution);
+          const start = resolveScreenPoint(element, gesture.startX, gesture.startY, effectiveResolution);
+          const end = resolveScreenPoint(element, event.clientX, event.clientY, effectiveResolution);
           if (!start || !end) return;
           if (gesture.moved < TAP_MAX_PX) {
             queueInput({ kind: 'tap', x: end.x, y: end.y });
@@ -2120,7 +2493,7 @@ window.__ModuleLoader__.load({
             });
           }
         },
-        [emuState, resolution, queueInput],
+        [emuState, effectiveResolution, queueInput],
       );
 
       const serverNow =
@@ -2147,10 +2520,13 @@ window.__ModuleLoader__.load({
       let buttonText = nextAction === 'stop' ? tr('action.stop') : tr('action.start');
       if (busy === 'start') buttonText = tr('action.starting');
       else if (busy === 'stop' || stopping) buttonText = tr('action.stopping');
+      const viewSub = h264Enabled
+        ? ' - ' + (h264.state.fps > 0 ? tr('view.fps', { n: h264.state.fps }) : tr('view.smooth'))
+        : '';
       const deviceSub =
-        online && emulator && emulator.avd
+        (online && emulator && emulator.avd
           ? String(emulator.avd) + (emulator.serial ? ' / ' + String(emulator.serial) : '')
-          : statusLabel(tr, emuState);
+          : statusLabel(tr, emuState)) + viewSub;
 
       return h(
         'div',
@@ -2268,7 +2644,7 @@ window.__ModuleLoader__.load({
                           className: 'gl-phone',
                           'data-orient': orientation,
                           style: {
-                            '--gl-ar': String(resolution.width) + ' / ' + String(resolution.height),
+                            '--gl-ar': String(effectiveResolution.width) + ' / ' + String(effectiveResolution.height),
                           },
                         },
                         h(
@@ -2287,17 +2663,33 @@ window.__ModuleLoader__.load({
                             onLostPointerCapture: onScreenPointerCancel,
                             onContextMenu: (event) => event.preventDefault(),
                           },
-                          online
-                            ? h('img', {
-                                key: 'stream',
-                                ref: imgRef,
-                                className: 'gl-screen-img',
-                                src: streamSrc,
-                                alt: tr('device.streamAlt'),
-                                draggable: false,
-                                onError: onStreamError,
-                                onLoad: onStreamLoad,
+                          online && h264Enabled
+                            ? h('canvas', {
+                                key: 'h264',
+                                ref: h264.canvasRef,
+                                className: 'gl-screen-img gl-screen-canvas',
+                                role: 'img',
+                                'aria-label': tr('device.streamAlt'),
                               })
+                            : online
+                              ? h('img', {
+                                  key: 'stream',
+                                  ref: imgRef,
+                                  className: 'gl-screen-img',
+                                  src: streamSrc,
+                                  alt: tr('device.streamAlt'),
+                                  draggable: false,
+                                  onError: onStreamError,
+                                  onLoad: onStreamLoad,
+                                })
+                              : null,
+                          h264Enabled && h264.state.status === 'connecting'
+                            ? h(
+                                'div',
+                                { className: 'gl-streamfail', role: 'status' },
+                                h('span', { className: 'gl-spin', 'aria-hidden': true }),
+                                h('span', null, tr('view.connecting')),
+                              )
                             : null,
                           !online
                             ? h(
@@ -2315,7 +2707,7 @@ window.__ModuleLoader__.load({
                                 ),
                               )
                             : null,
-                          online && streamFailed
+                          !h264Enabled && online && streamFailed
                             ? h(
                                 'div',
                                 { className: 'gl-streamfail', role: 'status' },
@@ -2330,11 +2722,58 @@ window.__ModuleLoader__.load({
                   tr,
                   online,
                   orientation,
+                  keyboardOpen,
+                  viewActive: h264Enabled,
+                  viewAvailable: h264Available,
+                  onView: toggleView,
+                  onKeyboard: () => setKeyboardOpen((open) => !open),
                   onKey: sendKey,
                   onRotate: rotateScreen,
                   onScreenshot: saveScreenshot,
                   onReload: reloadStream,
                 }),
+                online && keyboardOpen
+                  ? h(
+                      'form',
+                      {
+                        className: 'gl-kb',
+                        onSubmit: (event) => {
+                          event.preventDefault();
+                          sendText();
+                        },
+                      },
+                      h('input', {
+                        className: 'gl-kb-input',
+                        type: 'text',
+                        value: keyboardText,
+                        placeholder: tr('kb.placeholder'),
+                        'aria-label': tr('kb.placeholder'),
+                        autoComplete: 'off',
+                        autoCorrect: 'off',
+                        spellCheck: false,
+                        maxLength: 200,
+                        autoFocus: true,
+                        onChange: (event) => {
+                          const next = String(event.target.value || '').replace(/[^\x20-\x7E]/g, '');
+                          setKeyboardText(next);
+                        },
+                      }),
+                      h(
+                        'button',
+                        {
+                          type: 'submit',
+                          className: 'gl-btn gl-btn-primary gl-kb-send',
+                          disabled: keyboardText.trim() === '',
+                        },
+                        tr('kb.send'),
+                      ),
+                      h('button', { type: 'button', className: 'gl-tool', onClick: () => sendKey('enter'), title: tr('kb.enter') }, tr('kb.enter')),
+                      h('button', { type: 'button', className: 'gl-tool', onClick: () => sendKey('space'), title: tr('kb.space') }, tr('kb.space')),
+                      h('button', { type: 'button', className: 'gl-tool', onClick: () => sendKey('delete'), title: tr('kb.backspace') }, tr('kb.backspace')),
+                      h('button', { type: 'button', className: 'gl-tool', onClick: () => sendKey('escape'), title: tr('kb.esc') }, tr('kb.esc')),
+                      h('div', { className: 'gl-kb-hint' }, tr('kb.hint')),
+                    )
+                  : null,
               ),
             ),
             h(

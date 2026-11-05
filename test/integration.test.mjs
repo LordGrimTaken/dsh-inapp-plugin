@@ -6,6 +6,24 @@ import assert from 'node:assert/strict'
 import http from 'node:http'
 import { GameLab, normalizeConfig, resolveToolchain } from '../host/emulator.js'
 import { mountRoutes, ROUTE_PREFIX } from '../host/routes.js'
+import { detectBuildPlan } from '../host/build.js'
+
+test('build-plan detection understands this machine\'s Capacitor games', async () => {
+  const grave = await detectBuildPlan('C:\\dev\\dsh-workspace\\gravebound\\android')
+  assert.ok(grave !== null)
+  assert.equal(grave.kind, 'capacitor')
+  assert.equal(grave.appRoot.toLowerCase(), 'c:\\dev\\dsh-workspace\\gravebound')
+  assert.deepEqual(grave.steps.map((step) => step.id), ['project'])
+  assert.equal(grave.steps[0].command, 'npm')
+
+  const lanterns = await detectBuildPlan('C:\\dev\\dsh-workspace\\hundred-hearths\\app\\android')
+  assert.ok(lanterns !== null)
+  assert.equal(lanterns.kind, 'capacitor')
+  assert.deepEqual(lanterns.steps.map((step) => step.id), ['web', 'sync', 'gradle'])
+  assert.equal(lanterns.steps[2].cwd.toLowerCase(), 'c:\\dev\\dsh-workspace\\hundred-hearths\\app\\android')
+
+  assert.equal(await detectBuildPlan('C:\\does\\not\\exist'), null)
+})
 
 test('toolchain resolves the dev Android SDK on this machine', () => {
   const toolchain = resolveToolchain()

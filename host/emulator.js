@@ -21,11 +21,13 @@ import path from 'node:path'
 import os from 'node:os'
 import { FrameLoop, MultipartWriter } from './frame.js'
 import { scanLibrary, apkInfo, resolveAapt2 } from './library.js'
+import { detectBuildPlan } from './build.js'
+import { VideoLoop } from './video.js'
 
 const IS_WINDOWS = process.platform === 'win32'
 const PLUGIN = 'game-lab'
 /** Bumped when the host module changes so a live reload can be verified. */
-export const HOST_BUILD = '2026-11-05.5'
+export const HOST_BUILD = '2026-11-05.9'
 
 const DEFAULT_CONFIG = {
   /** AVD this panel owns. Created on first start when it is missing. */
@@ -248,6 +250,14 @@ export class GameLab {
     this.build = {
       state: 'idle',
       project: null,
+      kind: null,
+      appRoot: null,
+      androidDir: null,
+      phase: null,
+      phaseId: null,
+      stepIndex: 0,
+      stepCount: 0,
+      steps: [],
       log: [],
       startedAt: null,
       finishedAt: null,
@@ -258,6 +268,12 @@ export class GameLab {
     this.frameLoop = null
     this.latestFrame = null
     this.streamWriters = new Set()
+    this.videoLoop = null
+    this.videoWriter = null
+    this.videoConsumers = 0
+    this.videoDemandUntil = 0
+    this.videoRestartTimer = null
+    this.videoLastError = null
     this.consumers = 0
     this.frameDemandUntil = 0
     this.lastActivityAt = 0
@@ -278,6 +294,7 @@ export class GameLab {
     this.timers.push(setInterval(() => this.#tickIdle(), 10000))
     this.timers.push(setInterval(() => { this.#tickResources().catch(() => {}) }, 12000))
     this.timers.push(setInterval(() => { this.#tickFrames() }, 10000))
+    this.timers.push(setInterval(() => { this.#tickVideo() }, 10000))
     this.timers.push(setInterval(() => { this.#tickLeftoverEmulator().catch(() => {}) }, 20000))
     for (const timer of this.timers) timer.unref?.()
     this.#tickResources().catch(() => {})
@@ -310,13 +327,26 @@ export class GameLab {
         idleStopAt: this.#idleStopAt(),
         lastActivityAt: this.lastActivityAt > 0 ? this.lastActivityAt : null,
       },
+      video: {
+        active: this.videoLoop !== null && this.videoLoop.running,
+        consumers: this.videoConsumers,
+        error: this.videoLastError,
+        ...(this.videoLoop === null ? { fps: 0, kbps: 0, frames: 0, sps: false, pps: false, bytes: 0 } : this.videoLoop.stats),
+      },
       build: {
         state: this.build.state,
         project: this.build.project,
-        logTail: this.build.log.length > 0 ? this.build.log.slice(-25).join('\n') : null,
+        kind: this.build.kind,
+        phase: this.build.phase,
+        phaseId: this.build.phaseId,
+        stepIndex: this.build.stepIndex,
+        stepCount: this.build.stepCount,
+        steps: this.build.steps,
+        logTail: this.build.log.length > 0 ? this.build.log.slice(-40).join('\n') : null,
         startedAt: this.build.startedAt,
         finishedAt: this.build.finishedAt,
         ok: this.build.ok,
+        apkPath: this.build.apkPath,
       },
       config: {
         avdName: this.config.avdName,
@@ -497,6 +527,7 @@ export class GameLab {
     this.emulator.status = 'stopping'
     this.emulator.progress = 0
     this.#stopFrameLoop()
+    this.#stopVideoLoop()
     for (const writer of this.streamWriters) writer.close()
     this.streamWriters.clear()
     this.consumers = 0
@@ -594,87 +625,118 @@ export class GameLab {
     return { ok: true, packageName }
   }
 
-  /** Build a Gradle game project, then install and launch its newest debug APK. */
+  /**
+   * Build a game project and install the result. Detection covers plain
+   * Gradle projects and Capacitor apps (web build + `cap sync` + Gradle), so
+   * the APK contains the current web bundle instead of stale assets.
+   */
   async buildProject(projectPath) {
     if (this.build.state === 'running') throw new Error('a build is already running')
     if (typeof projectPath !== 'string' || projectPath.trim() === '') throw new Error('a project path is required')
-    const project = path.resolve(projectPath)
-    const gradlew = IS_WINDOWS ? path.join(project, 'gradlew.bat') : path.join(project, 'gradlew')
-    if (!existsSync(gradlew)) throw new Error(`no Gradle wrapper found in ${project}`)
-    if (!existsSync(path.join(project, 'settings.gradle')) && !existsSync(path.join(project, 'settings.gradle.kts'))) {
-      throw new Error(`${project} does not look like a Gradle project (no settings.gradle)`)
+    const plan = await detectBuildPlan(projectPath).catch(() => null)
+    if (plan === null || plan.steps.length === 0) {
+      throw new Error(`no buildable Gradle or Capacitor project found at ${path.resolve(projectPath)}`)
     }
-
     const startedAt = Date.now()
     this.build = {
       state: 'running',
-      project,
-      log: [`$ ${IS_WINDOWS ? 'gradlew.bat' : './gradlew'} assembleDebug`, `cwd: ${project}`],
+      project: plan.projectRoot,
+      kind: plan.kind,
+      appRoot: plan.appRoot,
+      androidDir: plan.androidDir,
+      phase: plan.steps[0].label,
+      phaseId: plan.steps[0].id,
+      stepIndex: 0,
+      stepCount: plan.steps.length,
+      steps: plan.steps.map((step) => step.label),
+      log: [
+        `[game-lab] ${plan.kind === 'capacitor' ? 'Capacitor' : 'Gradle'} project: ${plan.projectRoot}`,
+        ...plan.notes.map((note) => `[game-lab] ${note}`),
+      ],
       startedAt,
       finishedAt: null,
       ok: null,
       apkPath: null,
     }
-    this.touch(`build started ${project}`)
+    this.touch(`build started ${plan.projectRoot}`)
     if (!this.online) {
       // One click "build & play": bring the emulator up while Gradle runs.
       this.#note('build: booting the emulator for the install step')
       Promise.resolve().then(() => this.startEmulator({})).catch(() => {})
     }
-    const env = { ...process.env }
-    if (typeof this.toolchain.sdkDir === 'string') env.ANDROID_HOME = this.toolchain.sdkDir
-    const command = IS_WINDOWS ? 'gradlew.bat' : './gradlew'
-    const child = IS_WINDOWS
-      ? spawn('cmd.exe', ['/d', '/s', '/c', `${command} assembleDebug --console=plain`], {
-        cwd: project, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      : spawn('sh', ['-c', `${command} assembleDebug --console=plain`], {
-        cwd: project, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-      })
-    this.buildChild = child
-    const append = (chunk) => {
-      const text = chunk.toString('utf8')
-      for (const line of text.split(/\r?\n/)) {
-        if (line.trim() === '') continue
-        this.build.log.push(line.length > 500 ? `${line.slice(0, 500)}...` : line)
-      }
-      if (this.build.log.length > 400) this.build.log.splice(0, this.build.log.length - 400)
-    }
-    child.stdout?.on('data', append)
-    child.stderr?.on('data', append)
-    const timeout = setTimeout(() => {
-      append(Buffer.from('\n[game-lab] build timed out after 10 minutes; stopping it'))
-      this.#killBuildTree()
-    }, 10 * 60 * 1000)
-    timeout.unref?.()
-
-    child.once('close', (code) => {
-      clearTimeout(timeout)
-      this.buildChild = null
-      this.build.finishedAt = Date.now()
-      if (code === 0) {
-        this.#finishBuild(project, startedAt).catch((error) => {
-          this.build.state = 'error'
-          this.build.ok = false
-          this.build.log.push(`[game-lab] ${errorMessage(error)}`)
-          this.#note(`build install failed: ${errorMessage(error)}`)
-        })
-      } else {
+    Promise.resolve()
+      .then(() => this.#runBuildPlan(plan, startedAt))
+      .catch((error) => {
         this.build.state = 'error'
         this.build.ok = false
-        this.build.log.push(`[game-lab] gradle exited with code ${String(code)}`)
-        this.#note(`build failed (exit ${String(code)})`)
+        this.build.finishedAt = Date.now()
+        this.#appendBuildLog(Buffer.from(`[game-lab] ${errorMessage(error)}`))
+        this.#note(`build failed: ${errorMessage(error)}`)
+      })
+    return { ok: true, state: 'running', kind: plan.kind, steps: plan.steps.map((step) => step.id) }
+  }
+
+  /** Run every build step in order, then install and launch the APK. */
+  async #runBuildPlan(plan, startedAt) {
+    for (let index = 0; index < plan.steps.length; index += 1) {
+      const step = plan.steps[index]
+      this.build.stepIndex = index
+      this.build.phaseId = step.id
+      this.build.phase = step.label
+      this.#appendBuildLog(Buffer.from(`[game-lab] > ${step.label}  (${step.cwd})`))
+      const code = await this.#runBuildStep(step)
+      if (code !== 0) throw new Error(`${step.label} failed (exit ${String(code)})`)
+    }
+    await this.#finishBuild(plan, startedAt)
+  }
+
+  /** Run one build step through the platform shell; resolves with its code. */
+  #runBuildStep(step) {
+    return new Promise((resolve) => {
+      const env = { ...process.env }
+      if (typeof this.toolchain.sdkDir === 'string') env.ANDROID_HOME = this.toolchain.sdkDir
+      const line = `${step.command} ${step.args.join(' ')}`
+      const child = IS_WINDOWS
+        ? spawn('cmd.exe', ['/d', '/s', '/c', line], {
+          cwd: step.cwd, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        : spawn('sh', ['-c', line], {
+          cwd: step.cwd, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        })
+      this.buildChild = child
+      child.stdout?.on('data', (chunk) => this.#appendBuildLog(chunk))
+      child.stderr?.on('data', (chunk) => this.#appendBuildLog(chunk))
+      let timedOut = false
+      let settled = false
+      const finish = (code) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        this.buildChild = null
+        resolve(timedOut ? -1 : code)
       }
+      const timeout = setTimeout(() => {
+        timedOut = true
+        this.#appendBuildLog(Buffer.from(`[game-lab] ${step.label} timed out after 12 minutes`))
+        this.#killBuildTree()
+      }, 12 * 60 * 1000)
+      timeout.unref?.()
+      child.once('error', (error) => {
+        this.#appendBuildLog(Buffer.from(`[game-lab] ${errorMessage(error)}`))
+        finish(-1)
+      })
+      child.once('close', (code) => finish(typeof code === 'number' ? code : -1))
     })
-    child.once('error', (error) => {
-      clearTimeout(timeout)
-      this.buildChild = null
-      this.build.state = 'error'
-      this.build.ok = false
-      this.build.finishedAt = Date.now()
-      this.build.log.push(`[game-lab] ${errorMessage(error)}`)
-    })
-    return { ok: true, state: 'running' }
+  }
+
+  /** Append build output to the ring buffer the page polls. */
+  #appendBuildLog(chunk) {
+    const text = chunk.toString('utf8')
+    for (const line of text.split(/\r?\n/)) {
+      if (line.trim() === '') continue
+      this.build.log.push(line.length > 500 ? `${line.slice(0, 500)}...` : line)
+    }
+    if (this.build.log.length > 500) this.build.log.splice(0, this.build.log.length - 500)
   }
 
   /** Send one touch/key/rotation event. Coordinates are normalized 0..1. */
@@ -769,6 +831,46 @@ export class GameLab {
     return release
   }
 
+  /**
+   * Serve the live H.264 bitstream on one HTTP response. Only one viewer at a
+   * time, and the stream always starts fresh so it begins with SPS/PPS and a
+   * keyframe the decoder can configure from.
+   */
+  openVideoStream(res) {
+    if (!this.online) return { ok: false, code: 'emulator_offline', error: 'the emulator is not running' }
+    if (this.videoWriter !== null) return { ok: false, code: 'video_busy', error: 'a live video stream is already open' }
+    if (this.videoLoop !== null) this.#stopVideoLoop()
+    res.writeHead(200, {
+      'content-type': 'application/octet-stream',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'cross-origin-resource-policy': 'same-origin',
+      'referrer-policy': 'no-referrer',
+    })
+    const writer = { res, closed: false }
+    this.videoWriter = writer
+    this.videoConsumers = 1
+    this.videoDemandUntil = Date.now() + 120000
+    this.#ensureVideoLoop()
+    const release = () => {
+      if (writer.closed) return
+      writer.closed = true
+      if (this.videoWriter === writer) this.videoWriter = null
+      this.videoConsumers = 0
+      this.videoDemandUntil = Date.now() + 30000
+      try {
+        res.end()
+      } catch {
+        // Already gone.
+      }
+      res.off('close', release)
+      res.off('error', release)
+    }
+    res.on('close', release)
+    res.on('error', release)
+    return { ok: true }
+  }
+
   /** One PNG of the newest frame, waiting briefly for the loop to warm up. */
   async framePng() {
     if (!this.online) return undefined
@@ -789,6 +891,7 @@ export class GameLab {
     this.#killBuildTree()
     for (const writer of this.streamWriters) writer.close()
     this.streamWriters.clear()
+    this.#stopVideoLoop()
     if (this.emulator.status !== 'off') await this.stopEmulator({ reason: 'shutdown' }).catch(() => {})
     this.#stopFrameLoop()
     this.#note('disposed')
@@ -992,9 +1095,21 @@ export class GameLab {
       if (match !== null) this.emulator.resolution = { width: Number(match[1]), height: Number(match[2]) }
     }
     this.touch('online')
+    await this.#prepareDevice(serial)
     this.#ensureFrameLoop()
     this.#tickResources().catch(() => {})
     this.#note(`online ${serial} (${avdName}) boot=${this.emulator.bootElapsedMs === null ? '?' : Math.round(this.emulator.bootElapsedMs / 1000) + 's'}`)
+  }
+
+  /**
+   * Keep the emulator display awake: a sleeping display freezes both the game
+   * and screenrecord, and the lock screen would hide the game we launched.
+   */
+  async #prepareDevice(serial) {
+    await this.#shell(serial, ['svc', 'power', 'stayon', 'true'], 10000).catch(() => {})
+    await this.#shell(serial, ['settings', 'put', 'system', 'screen_off_timeout', '2147483647'], 10000).catch(() => {})
+    await this.#shell(serial, ['wm', 'dismiss-keyguard'], 10000).catch(() => {})
+    await this.#shell(serial, ['input', 'keyevent', 'KEYCODE_WAKEUP'], 10000).catch(() => {})
   }
 
   async #launchPackage(packageName, launchableActivity) {
@@ -1079,6 +1194,108 @@ export class GameLab {
       }
     }
     this.latestFrame = null
+  }
+
+  /** Start (or reuse) the screenrecord H.264 loop for the online device. */
+  #ensureVideoLoop() {
+    if (this.disposed || !this.online) return null
+    const serial = this.emulator.serial
+    if (this.videoLoop !== null && this.videoLoop.running && this.videoLoop.serial === serial) {
+      this.videoDemandUntil = Math.max(this.videoDemandUntil, Date.now() + 60000)
+      return this.videoLoop
+    }
+    // Keep the HTTP response that openVideoStream just claimed; only the old
+    // screenrecord process is replaced.
+    this.#stopVideoLoop(true)
+    const loop = new VideoLoop({ adb: this.toolchain.adb, serial })
+    loop.onExit = (detail) => {
+      const stderr = loop.stderrLines
+      this.videoLastError = stderr.length > 0 ? `${detail}: ${stderr[stderr.length - 1]}` : detail
+      this.#note(`video loop ended (${detail})`)
+      if (this.disposed || !this.online) return
+      if (this.videoConsumers === 0 && Date.now() > this.videoDemandUntil) return
+      if (this.videoRestartTimer !== null) return
+      this.videoRestartTimer = setTimeout(() => {
+        this.videoRestartTimer = null
+        if (this.disposed || !this.online) return
+        if (this.videoConsumers === 0 && Date.now() > this.videoDemandUntil) return
+        this.#ensureVideoLoop()
+      }, 800)
+      this.videoRestartTimer.unref?.()
+    }
+    loop.addListener((chunk) => this.#broadcastVideo(chunk))
+    loop.start()
+    this.videoLoop = loop
+    this.videoLastError = null
+    this.videoDemandUntil = Math.max(this.videoDemandUntil, Date.now() + 60000)
+    return loop
+  }
+
+  /** Forward one encoded chunk to the single live viewer. */
+  #broadcastVideo(chunk) {
+    const writer = this.videoWriter
+    if (writer === null || writer.closed) return
+    try {
+      // Never end the response just because one write crosses the socket's
+      // high-water mark - a 20 KB SPS+IDR chunk does that every time. Node
+      // buffers the rest and the 100-500 kbps stream drains immediately on
+      // loopback. Only a genuinely stuck client (several MB queued) is cut
+      // off, and then the page reconnects for a fresh keyframe.
+      writer.res.write(chunk)
+      if (typeof writer.res.writableLength === 'number' && writer.res.writableLength > 8 * 1024 * 1024) {
+        writer.closed = true
+        this.videoWriter = null
+        this.videoConsumers = 0
+        this.videoDemandUntil = Date.now() + 30000
+        try {
+          writer.res.end()
+        } catch {
+          // Already gone.
+        }
+      }
+    } catch {
+      writer.closed = true
+      this.videoWriter = null
+      this.videoConsumers = 0
+      this.videoDemandUntil = Date.now() + 30000
+    }
+  }
+
+  #stopVideoLoop(preserveWriter = false) {
+    if (this.videoRestartTimer !== null) {
+      clearTimeout(this.videoRestartTimer)
+      this.videoRestartTimer = null
+    }
+    if (this.videoLoop !== null) {
+      this.videoLoop.stop()
+      this.videoLoop = null
+    }
+    if (preserveWriter) return
+    const writer = this.videoWriter
+    if (writer !== null) {
+      writer.closed = true
+      this.videoWriter = null
+      try {
+        writer.res.end()
+      } catch {
+        // Already gone.
+      }
+    }
+    this.videoConsumers = 0
+  }
+
+  #tickVideo() {
+    if (this.disposed || !this.online) {
+      if (this.videoLoop !== null || this.videoWriter !== null) this.#stopVideoLoop()
+      return
+    }
+    if (this.videoConsumers > 0 && (this.videoLoop === null || !this.videoLoop.running)) {
+      this.#ensureVideoLoop()
+      return
+    }
+    if (this.videoConsumers === 0 && this.videoLoop !== null && Date.now() > this.videoDemandUntil) {
+      this.#stopVideoLoop()
+    }
   }
 
   #tickIdle() {
@@ -1176,28 +1393,50 @@ export class GameLab {
     }
   }
 
-  async #finishBuild(project, startedAt) {
-    let apkPath = await findNewestApk(project, startedAt - 5000)
+  async #finishBuild(plan, startedAt) {
+    const roots = Array.isArray(plan.searchRoots) && plan.searchRoots.length > 0 ? plan.searchRoots : [plan.androidDir]
+    let apkPath = null
+    let apkMtime = 0
+    for (const root of roots) {
+      const candidate = await findNewestApk(root, startedAt - 5000)
+      if (candidate === null) continue
+      const info = await stat(candidate).catch(() => null)
+      const mtime = info === null ? 0 : info.mtimeMs
+      if (apkPath === null || mtime > apkMtime) {
+        apkPath = candidate
+        apkMtime = mtime
+      }
+    }
     if (apkPath === null) {
-      // A fully up-to-date Gradle run writes no APK at all; reuse the newest
+      // A fully up-to-date build writes no APK at all; reuse the newest
       // existing build output instead of reporting a failed build.
-      apkPath = await findNewestApk(project, 0)
-      if (apkPath !== null) this.build.log.push(`[game-lab] no new APK (build was up to date); using ${apkPath}`)
+      for (const root of roots) {
+        const candidate = await findNewestApk(root, 0)
+        if (candidate === null) continue
+        const info = await stat(candidate).catch(() => null)
+        const mtime = info === null ? 0 : info.mtimeMs
+        if (apkPath === null || mtime > apkMtime) {
+          apkPath = candidate
+          apkMtime = mtime
+        }
+      }
+      if (apkPath !== null) this.#appendBuildLog(Buffer.from(`[game-lab] no new APK (build was up to date); using ${apkPath}`))
     }
     if (apkPath === null) throw new Error('the build succeeded but no APK was found under build/outputs')
     this.build.apkPath = apkPath
+    this.#appendBuildLog(Buffer.from(`[game-lab] installing ${apkPath}`))
     const ready = await this.#awaitOnline(150000)
     if (!ready) throw new Error('the build succeeded but the emulator did not come online to install it')
     const installed = await this.installAndLaunch(apkPath)
     this.build.state = 'done'
     this.build.ok = true
     this.build.finishedAt = Date.now()
-    this.build.log.push(`[game-lab] built and installed ${installed.packageName ?? ''}`.trim())
-    this.touch(`build done ${project}`)
+    this.build.phase = 'Done'
+    this.#appendBuildLog(Buffer.from(`[game-lab] built and installed ${installed.packageName ?? ''}`.trim()))
+    this.touch(`build done ${plan.projectRoot}`)
   }
 
-  /** Wait for the emulator to become usable, used by the build-install step. */
-  async #awaitOnline(timeoutMs) {
+  /** Wait for the emulator to become usable, used by the build-install step. */  async #awaitOnline(timeoutMs) {
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       if (this.online) return true
@@ -1247,6 +1486,13 @@ const KEY_CODES = {
   enter: 'KEYCODE_ENTER',
   delete: 'KEYCODE_DEL',
   menu: 'KEYCODE_MENU',
+  space: 'KEYCODE_SPACE',
+  escape: 'KEYCODE_ESCAPE',
+  tab: 'KEYCODE_TAB',
+  dpad_up: 'KEYCODE_DPAD_UP',
+  dpad_down: 'KEYCODE_DPAD_DOWN',
+  dpad_left: 'KEYCODE_DPAD_LEFT',
+  dpad_right: 'KEYCODE_DPAD_RIGHT',
 }
 
 /**

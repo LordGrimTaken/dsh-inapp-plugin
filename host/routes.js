@@ -300,6 +300,15 @@ async function handleRequest(req, res, lab) {
       lab.openStream(res)
       return
     }
+    case '/stream.h264': {
+      requireMethod(req, 'GET')
+      requireTrusted(req, false)
+      const opened = lab.openVideoStream(res)
+      if (!opened.ok) {
+        sendJson(res, 409, { ok: false, code: opened.code, error: opened.error })
+      }
+      return
+    }
     case '/logs': {
       requireMethod(req, 'GET')
       requireTrusted(req, false)
