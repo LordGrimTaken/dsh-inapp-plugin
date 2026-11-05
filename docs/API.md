@@ -69,9 +69,13 @@ and long-lived. JSON error shape:
     "ramMb": 2048, "cores": 2, "gpuMode": "host", "gameRoots": ["C:\\Games"]
   },
   "toolchain": { "ok": true, "reason": null, "avdmanager": true, "aapt2": true },
+  "avds": ["gamelab"],
   "notes": ["..."]
 }
 ```
+
+`avds` lists installed AVD names (up to 40) so the offline screen can offer a
+picker; `POST /emulator {action:"start", avd:"<name>"}` accepts the choice.
 
 `build.state` is `idle|running|done|error`; while running, `phase` is the
 current step label and `stepIndex/stepCount` describe progress.

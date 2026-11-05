@@ -65,8 +65,10 @@ when you press Play, not for every file up front.
 The plugin's AVD is deliberately small: 720x1280 @ 320 dpi, host GPU, cold
 boot, no snapshots, 2 GB data partition. If you already have an AVD you prefer,
 set `avdName` to it; the plugin will use it as-is (it only patches a
-**newly-created** AVD). Existing emulators are adopted instead of duplicated
-when one is online.
+**newly-created** AVD). The offline screen also lists all installed AVDs
+(`/status.avds`) and lets you pick one for the next Start; that choice is
+persisted per browser and overrides `avdName` for that start. Existing
+emulators are adopted instead of duplicated when one is online.
 
 A fresh AVD is created with `avdmanager` from the newest x86_64 system image,
 then configured with:

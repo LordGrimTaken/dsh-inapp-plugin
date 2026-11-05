@@ -72,6 +72,8 @@ Coverage:
   `fps` up to ~19 during motion; bitrate ~0.1-1.0 Mbps.
 - One viewer at a time; a second request returns 409 `video_busy`, and a new
   stream restarts the encoder so SPS/PPS + IDR are always first.
+- `/status.avds` returned `["gamelab"]` on this machine after the v1.2 reload
+  (host build `2026-11-05.10`), so the offline AVD picker has data to show.
 
 ## Install / launch / build
 
@@ -104,6 +106,9 @@ APK with stale web assets; the plan now rebuilds and syncs the web bundle first.
   verified with ffmpeg and the client parses Annex-B/derives the codec string in
   code, but the actual canvas rendering was not observed. The page falls back
   to the PNG view if the stream/decoder fails.
+- The v1.2 Pad panel, AVD select and search persistence were exercised through
+  the client stub loader and syntax/locale checks, not in a live browser; their
+  host counterparts (`/status.avds`, `POST /emulator {avd}`) are verified.
 - ADBKeyboard/CJK text input, audio, camera, Play Store, a physical USB phone
   as target, and multiple simultaneous emulators.
 - Auto-creating a brand-new AVD on a machine where `gamelab` does not exist

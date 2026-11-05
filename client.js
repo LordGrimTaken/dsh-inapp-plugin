@@ -208,6 +208,19 @@ window.__ModuleLoader__.load({
       'kb.hint': 'ASCII only. Tap the game input field first, then send.',
       'kb.sent': 'Text sent.',
 
+      'pad.toggle': 'Pad',
+      'pad.title': 'On-screen game controls',
+      'pad.up': 'D-pad up',
+      'pad.down': 'D-pad down',
+      'pad.left': 'D-pad left',
+      'pad.right': 'D-pad right',
+      'pad.ok': 'OK / Enter',
+      'pad.a': 'A (Enter)',
+      'pad.b': 'B (Back)',
+      'pad.start': 'Start',
+      'pad.hint': 'Tap keys (not held). D-pad = arrow keys, A = Enter, B = Back, Start = Menu.',
+      'device.avdLabel': 'AVD',
+
       'banner.dismiss': 'Dismiss message',
 
       'conn.offline': 'Host unreachable',
@@ -416,6 +429,25 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------------------ */
 
     const VIEW_MODE_KEY = 'dsh.game-lab.viewMode';
+    const LIB_QUERY_KEY = 'dsh.game-lab.query';
+    const AVD_KEY = 'dsh.game-lab.avd';
+
+    function readStored(key, fallback) {
+      try {
+        const value = window.localStorage.getItem(key);
+        return typeof value === 'string' ? value : fallback;
+      } catch (error) {
+        return fallback;
+      }
+    }
+
+    function writeStored(key, value) {
+      try {
+        window.localStorage.setItem(key, String(value));
+      } catch (error) {
+        /* persistence is best effort */
+      }
+    }
 
     function readViewMode() {
       try {
@@ -1101,6 +1133,34 @@ window.__ModuleLoader__.load({
 .gl-kb-input:focus { border-color:var(--dsw-alias-brand-primary); }
 .gl-kb-hint { flex-basis:100%; font-size:10.5px; color:var(--dsw-alias-label-secondary); }
 
+/* device picker + on-screen pad */
+.gl-avd { display:flex; flex-direction:column; gap:4px; margin-top:12px; text-align:left; }
+.gl-avd-label { font-size:10px; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--dsw-alias-label-secondary); }
+.gl-avd-select { height:30px; padding:0 8px; border:1px solid var(--dsw-alias-border-l2);
+  border-radius:6px; background:var(--dsw-alias-bg-base); color:var(--dsw-alias-label-primary);
+  font-size:12px; }
+.gl-pad { display:flex; flex-wrap:wrap; gap:14px; align-items:center; padding:10px 12px;
+  border-top:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); }
+.gl-pad-grid { display:grid; grid-template-columns:repeat(3, 40px); grid-template-rows:repeat(3, 34px); gap:5px; }
+.gl-pad-btn { display:inline-flex; align-items:center; justify-content:center;
+  min-width:34px; height:32px; padding:0 8px; border:1px solid var(--dsw-alias-border-l2);
+  border-radius:7px; background:var(--dsw-alias-bg-layer-2);
+  color:var(--dsw-alias-label-primary); font-size:12px; cursor:pointer; }
+.gl-pad-btn:hover { border-color:var(--dsw-alias-brand-primary);
+  color:var(--dsw-alias-brand-primary); }
+.gl-pad-up { grid-area:1 / 2; }
+.gl-pad-left { grid-area:2 / 1; }
+.gl-pad-ok { grid-area:2 / 2; font-size:10px; }
+.gl-pad-right { grid-area:2 / 3; }
+.gl-pad-down { grid-area:3 / 2; }
+.gl-pad-actions { display:flex; align-items:center; gap:8px; }
+.gl-pad-a, .gl-pad-b { width:40px; height:40px; border-radius:999px; font-weight:600; }
+.gl-pad-a { color:var(--dsw-alias-state-success-primary); }
+.gl-pad-b { color:var(--dsw-alias-state-warn-primary); }
+.gl-pad-start { height:40px; padding:0 12px; border-radius:999px; }
+.gl-pad-hint { flex-basis:100%; font-size:10.5px; color:var(--dsw-alias-label-secondary); }
+
 /* runtime readouts */
 .gl-kv { display:flex; align-items:baseline; justify-content:space-between; gap:12px;
   min-width:0; padding:6px 0; }
@@ -1244,7 +1304,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function Toolbar({ tr, online, orientation, onKey, onRotate, onScreenshot, onReload, keyboardOpen, onKeyboard, viewActive, onView, viewAvailable }) {
+    function Toolbar({ tr, online, orientation, onKey, onRotate, onScreenshot, onReload, keyboardOpen, onKeyboard, viewActive, onView, viewAvailable, padOpen, onPad }) {
       const rotateTo = tr(orientation === 'portrait' ? 'device.landscape' : 'device.portrait');
       const rotateLabel = tr('device.rotateTo', { value: rotateTo });
       const tool = (key, label, icon, onClick, title, active) =>
@@ -1285,14 +1345,20 @@ window.__ModuleLoader__.load({
           ? tool('view', tr('view.smooth'), h(IconBolt, { size: 14 }), onView, tr(viewActive ? 'view.smoothTitle' : 'view.compatTitle'), viewActive)
           : null,
         tool('kb', tr('kb.toggle'), h(IconKeyboard, { size: 14 }), onKeyboard, tr('kb.title'), keyboardOpen),
+        tool('pad', tr('pad.toggle'), h(IconGamepad, { size: 14 }), onPad, tr('pad.title'), padOpen),
         h('span', { key: 'hint', className: 'gl-toolbar-hint' }, tr('device.tapHint')),
       );
     }
 
-    function DeviceOffline({ tr, emulator, config, busy, statusError, onStart }) {
+    function DeviceOffline({ tr, emulator, config, busy, statusError, onStart, avds, selectedAvd, onSelectAvd }) {
       const idleMinutes =
         config && typeof config.idleMinutes === 'number' ? config.idleMinutes : DEFAULT_IDLE_MINUTES;
       const error = emulator && emulator.error ? String(emulator.error) : statusError;
+      const currentAvd = selectedAvd || (config && config.avdName) || '';
+      const choices = [];
+      for (const name of [...(Array.isArray(avds) ? avds : []), currentAvd]) {
+        if (typeof name === 'string' && name !== '' && !choices.includes(name)) choices.push(name);
+      }
       return h(
         'div',
         { className: 'gl-offline' },
@@ -1300,6 +1366,24 @@ window.__ModuleLoader__.load({
         h('div', { className: 'gl-offline-title' }, tr('device.offTitle')),
         h('div', { className: 'gl-offline-body' }, tr('device.offBody')),
         error ? h('div', { className: 'gl-offline-error' }, error) : null,
+        choices.length > 0
+          ? h(
+              'label',
+              { className: 'gl-avd' },
+              h('span', { className: 'gl-avd-label' }, tr('device.avdLabel')),
+              h(
+                'select',
+                {
+                  className: 'gl-avd-select',
+                  value: currentAvd,
+                  disabled: Boolean(busy),
+                  'aria-label': tr('device.avdLabel'),
+                  onChange: (event) => onSelectAvd(String(event.target.value || '')),
+                },
+                choices.map((name) => h('option', { key: 'avd:' + name, value: name }, name)),
+              ),
+            )
+          : null,
         h(
           'button',
           {
@@ -1363,7 +1447,7 @@ window.__ModuleLoader__.load({
 
     function LibraryCard(props) {
       const tr = props.tr;
-      const [query, setQuery] = useState('');
+      const [query, setQuery] = useState(() => readStored(LIB_QUERY_KEY, ''));
       const [expanded, setExpanded] = useState({});
       const [limit, setLimit] = useState(LIB_PAGE_ROWS);
       const needle = query.trim().toLowerCase();
@@ -1519,7 +1603,11 @@ window.__ModuleLoader__.load({
               'aria-label': tr('lib.search'),
               spellCheck: false,
               autoComplete: 'off',
-              onChange: (event) => setQuery(event.target.value),
+              onChange: (event) => {
+                const next = String(event.target.value || '');
+                setQuery(next);
+                writeStored(LIB_QUERY_KEY, next);
+              },
             }),
           ),
           body,
@@ -1894,6 +1982,8 @@ window.__ModuleLoader__.load({
       const [logPackage, setLogPackage] = useState('');
       const [keyboardOpen, setKeyboardOpen] = useState(false);
       const [keyboardText, setKeyboardText] = useState('');
+      const [padOpen, setPadOpen] = useState(false);
+      const [selectedAvd, setSelectedAvd] = useState(() => readStored(AVD_KEY, ''));
       const [visible, setVisible] = useState(false);
       const [now, setNow] = useState(() => Date.now());
 
@@ -2207,7 +2297,10 @@ window.__ModuleLoader__.load({
           setBanner(null);
           try {
             const body = { action };
-            if (action === 'start' && config && config.avdName) body.avd = config.avdName;
+            if (action === 'start') {
+              const avd = selectedAvd || (config && config.avdName) || '';
+              if (avd !== '') body.avd = avd;
+            }
             await post('/emulator', body);
             if (!aliveRef.current) return;
             await fetchStatus();
@@ -2220,7 +2313,7 @@ window.__ModuleLoader__.load({
             if (aliveRef.current) setBusy(null);
           }
         },
-        [busy, config, post, fetchStatus, tr],
+        [busy, config, selectedAvd, post, fetchStatus, tr],
       );
 
       const playGame = useCallback(
@@ -2398,6 +2491,13 @@ window.__ModuleLoader__.load({
         ? { width: h264.state.width, height: h264.state.height }
         : null;
       const effectiveResolution = videoSize !== null ? videoSize : resolution;
+
+      useEffect(() => {
+        if (selectedAvd !== '') return;
+        if (config && typeof config.avdName === 'string' && config.avdName !== '') {
+          setSelectedAvd(config.avdName);
+        }
+      }, [selectedAvd, config]);
 
       const toggleView = useCallback(() => {
         const next = h264Enabled ? 'png' : 'auto';
@@ -2636,6 +2736,12 @@ window.__ModuleLoader__.load({
                         config,
                         busy,
                         statusError,
+                        avds: status && Array.isArray(status.avds) ? status.avds : [],
+                        selectedAvd,
+                        onSelectAvd: (name) => {
+                          setSelectedAvd(name);
+                          writeStored(AVD_KEY, name);
+                        },
                         onStart: () => runEmulatorAction('start'),
                       })
                     : h(
@@ -2723,10 +2829,12 @@ window.__ModuleLoader__.load({
                   online,
                   orientation,
                   keyboardOpen,
+                  padOpen,
                   viewActive: h264Enabled,
                   viewAvailable: h264Available,
                   onView: toggleView,
                   onKeyboard: () => setKeyboardOpen((open) => !open),
+                  onPad: () => setPadOpen((open) => !open),
                   onKey: sendKey,
                   onRotate: rotateScreen,
                   onScreenshot: saveScreenshot,
@@ -2772,6 +2880,109 @@ window.__ModuleLoader__.load({
                       h('button', { type: 'button', className: 'gl-tool', onClick: () => sendKey('delete'), title: tr('kb.backspace') }, tr('kb.backspace')),
                       h('button', { type: 'button', className: 'gl-tool', onClick: () => sendKey('escape'), title: tr('kb.esc') }, tr('kb.esc')),
                       h('div', { className: 'gl-kb-hint' }, tr('kb.hint')),
+                    )
+                  : null,
+                online && padOpen
+                  ? h(
+                      'div',
+                      { className: 'gl-pad' },
+                      h(
+                        'div',
+                        { className: 'gl-pad-grid' },
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-up',
+                            'aria-label': tr('pad.up'),
+                            title: tr('pad.up'),
+                            onClick: () => sendKey('dpad_up'),
+                          },
+                          '^',
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-left',
+                            'aria-label': tr('pad.left'),
+                            title: tr('pad.left'),
+                            onClick: () => sendKey('dpad_left'),
+                          },
+                          '<',
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-ok',
+                            'aria-label': tr('pad.ok'),
+                            title: tr('pad.ok'),
+                            onClick: () => sendKey('enter'),
+                          },
+                          'OK',
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-right',
+                            'aria-label': tr('pad.right'),
+                            title: tr('pad.right'),
+                            onClick: () => sendKey('dpad_right'),
+                          },
+                          '>',
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-down',
+                            'aria-label': tr('pad.down'),
+                            title: tr('pad.down'),
+                            onClick: () => sendKey('dpad_down'),
+                          },
+                          'v',
+                        ),
+                      ),
+                      h(
+                        'div',
+                        { className: 'gl-pad-actions' },
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-a',
+                            'aria-label': tr('pad.a'),
+                            title: tr('pad.a'),
+                            onClick: () => sendKey('enter'),
+                          },
+                          'A',
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-b',
+                            'aria-label': tr('pad.b'),
+                            title: tr('pad.b'),
+                            onClick: () => sendKey('back'),
+                          },
+                          'B',
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'gl-pad-btn gl-pad-start',
+                            'aria-label': tr('pad.start'),
+                            title: tr('pad.start'),
+                            onClick: () => sendKey('menu'),
+                          },
+                          tr('pad.start'),
+                        ),
+                      ),
+                      h('div', { className: 'gl-pad-hint' }, tr('pad.hint')),
                     )
                   : null,
               ),

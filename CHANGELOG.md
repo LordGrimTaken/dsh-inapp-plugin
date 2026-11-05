@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
+## [1.2.0] - 2026-11-05
+
+### Added
+
+- On-screen **Pad** panel: D-pad (arrow keys), A (Enter), B (Back) and
+  Start (Menu), for games that expect a controller/keyboard rather than only
+  touch.
+- **AVD picker** in the offline screen. `/status` now exposes `avds` (up to 40
+  installed AVD names); the selected AVD is persisted in `localStorage` and
+  sent to `POST /emulator`.
+- The game-library search box remembers its last query
+  (`dsh.game-lab.query`).
+- `HOST_BUILD` bumped for the new status field.
+
 ## [1.1.0] - 2026-11-05
 
 ### Added

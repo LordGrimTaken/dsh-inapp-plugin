@@ -63,6 +63,7 @@ test('status snapshot has the shape the page polls', () => {
   assert.equal(status.config.avdName, 'gamelab');
   assert.equal(status.build.state, 'idle');
   assert.equal(typeof status.video, 'object');
+  assert.ok(Array.isArray(status.avds));
   lab.dispose().catch(() => {});
 });
 

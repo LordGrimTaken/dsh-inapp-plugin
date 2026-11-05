@@ -7,6 +7,10 @@ emulator into an in-app test bench. It was built for the loop *"change the
 game, build it, see it on a device"* without installing MEmu/LDPlayer/BlueStacks
 or keeping a second emulator window around.
 
+**Current: v1.2** — smooth H.264/WebCodecs view with automatic PNG fallback,
+Capacitor-aware Build & play, keyboard and on-screen gamepad panels, AVD picker,
+and a library search that remembers your last query.
+
 ![The Android emulator live view inside Game Lab](assets/android-emulator.png)
 
 ## Why
@@ -21,16 +25,18 @@ stops itself after an idle period.
 
 - **On-demand headless AVD** — 720x1280, up to 2 vCPU, host GPU, no window,
   no snapshots. Auto-created from an installed x86_64 system image the first
-  time the configured AVD does not exist.
+  time the configured AVD does not exist. The offline screen lets you pick any
+  installed AVD (`/status.avds`) before pressing Start.
 - **Smooth live view** — H.264 from the emulator's encoder, decoded with
   **WebCodecs** on a canvas (measured ~19 fps while content changes). Falls
   back to the PNG multipart stream (about 1 fps) automatically if WebCodecs is
   unavailable; a **Smooth/Compat** toggle is in the toolbar.
 - **Real touch input** — tap, drag/swipe, Back/Home/Recents, rotation, hardware
-  keys, plus a **Keyboard** panel for ASCII text and Enter/Space/Backspace/Esc.
+  keys, a **Keyboard** panel for ASCII text and Enter/Space/Backspace/Esc, and
+  an on-screen **Pad** (D-pad, A/B, Start) for games that expect keys.
 - **Game library** — scans your folders for APKs, groups builds by name
-  (newest first, older builds collapsible), and lists Gradle/Capacitor game
-  projects. **Play** installs and launches an APK.
+  (newest first, older builds collapsible), remembers your search, and lists
+  Gradle/Capacitor game projects. **Play** installs and launches an APK.
 - **Build & play** — detects the project type and runs the right pipeline:
   plain Gradle (`gradlew assembleDebug`) or Capacitor
   (`npm run android:apk`, or `npm run build` + `npx cap sync android` +

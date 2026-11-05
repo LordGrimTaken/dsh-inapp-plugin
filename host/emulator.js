@@ -27,7 +27,7 @@ import { VideoLoop } from './video.js'
 const IS_WINDOWS = process.platform === 'win32'
 const PLUGIN = 'game-lab'
 /** Bumped when the host module changes so a live reload can be verified. */
-export const HOST_BUILD = '2026-11-05.9'
+export const HOST_BUILD = '2026-11-05.10'
 
 const DEFAULT_CONFIG = {
   /** AVD this panel owns. Created on first start when it is missing. */
@@ -298,6 +298,7 @@ export class GameLab {
     this.timers.push(setInterval(() => { this.#tickLeftoverEmulator().catch(() => {}) }, 20000))
     for (const timer of this.timers) timer.unref?.()
     this.#tickResources().catch(() => {})
+    this.#listAvds().catch(() => {})
     this.#note(this.toolchain.ok
       ? `ready: sdk=${this.toolchain.sdkDir ?? 'PATH'} aapt2=${this.toolchain.aapt2 ?? 'missing'} avd=${this.config.avdName}`
       : `not ready: ${this.toolchain.reason ?? 'unknown toolchain error'}`)
@@ -363,6 +364,7 @@ export class GameLab {
         avdmanager: this.toolchain.avdmanager !== null,
         aapt2: this.toolchain.aapt2 !== null,
       },
+      avds: this.avdCache.list.slice(0, 40),
       notes: this.notes.slice(-8),
     }
   }
