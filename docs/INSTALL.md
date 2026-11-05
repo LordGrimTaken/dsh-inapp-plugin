@@ -17,8 +17,9 @@ emulator that is already on the machine.
 
 ## Install the bundle
 
-From an agent session in DSH (or the DSH shell), install the repository
-directory as a bundle:
+From an agent session in DSH, install the repository directory as a bundle.
+`plugin_manager` is a DSH **agent tool**, not a shell command; ask your agent
+to run it (or use the equivalent action in your DSH build if one is exposed):
 
 ```text
 plugin_manager install_bundle target: C:\path\to\game-lab

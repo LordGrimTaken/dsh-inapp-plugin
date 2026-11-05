@@ -51,11 +51,14 @@ Node/npm for Capacitor projects. Windows is the tested platform; the host code
 has POSIX branches but is not exercised on macOS/Linux yet.
 
 ```text
-plugin_manager install_bundle target: <absolute path to this repo>
-
-# or, from a DSH shell:
-dsh --profile <profile> ...
+# Ask your DSH agent to install this local folder as a bundle.
+# `plugin_manager` is a DSH agent tool, not a shell command.
+plugin_manager install_bundle target: <absolute path to this clone>
 ```
+
+The agent tool links the folder into the profile, adds it to the bundle
+selection and activates it live. If you prefer to wire a profile by hand, see
+[docs/INSTALL.md](docs/INSTALL.md).
 
 Then:
 
