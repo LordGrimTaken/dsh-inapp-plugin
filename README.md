@@ -46,6 +46,10 @@ stops itself after an idle period.
   the emulator stops after 5 idle minutes (configurable), and a running build
   is never interrupted by the idle timer. The display is kept awake while it
   runs so games don't freeze behind a lock screen.
+- **No emulator downloads** — it drives the Android SDK emulator and the
+  `gamelab` AVD already on the machine. It never installs another emulator or
+  fetches a system image; if no x86_64 image exists it reports the gap instead
+  of downloading one.
 - **Diagnostics** — live fps/RAM/CPU, logcat tail, one-click screenshot, and a
   status API.
 
