@@ -1,0 +1,16 @@
+# Game Lab bundle patch: mounts the plugin row into a profile layer stack.
+# The profile's own cordis.patch.yml and any --patch overlays still apply after
+# this layer; rows here can be overridden by id in later layers.
+- insert:
+    - id: game-lab
+      name: '@local/game-lab'
+      config:
+        avdName: gamelab
+        ramMb: 2048
+        cores: 2
+        gpuMode: host
+        idleMinutes: 5
+        maxFps: 8
+        gameRoots:
+          - C:\dev\dsh-workspace
+          - C:\Users\Austin\Deliverables
