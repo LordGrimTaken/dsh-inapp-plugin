@@ -1,5 +1,8 @@
 import { readFileSync } from 'node:fs'
-const src = readFileSync('C:/Users/Austin/dsh-plugins/game-lab/client.js', 'utf8')
+import { fileURLToPath } from 'node:url'
+
+const clientPath = fileURLToPath(new URL('../client.js', import.meta.url))
+const src = readFileSync(clientPath, 'utf8')
 const used = new Set()
 for (const match of src.matchAll(/tr\('([^']+)'/g)) used.add(match[1])
 for (const match of src.matchAll(/tr\("([^"]+)"/g)) used.add(match[1])

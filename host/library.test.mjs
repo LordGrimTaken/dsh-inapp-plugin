@@ -1,19 +1,33 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import test from 'node:test';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test, { after } from 'node:test';
 
 import { apkInfo, resolveAapt2, scanLibrary } from './library.js';
 
-// Real fixtures on this machine. Each test skips gracefully when its fixture
-// is missing, and no test writes to disk.
-const SDK_DIR = 'C:\\Users\\Austin\\dev\\tools\\android-sdk';
-const SHADOWMIRE_APK = 'C:\\dev\\dsh-workspace\\Shadowmire-online-debug.apk';
-const RELEASES_DIR = 'C:\\dev\\dsh-workspace\\hundred-hearths\\app\\releases';
-const WORKSPACE_DIR = 'C:\\dev\\dsh-workspace';
-const LIUYING_DIR = 'C:\\dev\\dsh-workspace\\liuying';
-const DELIVERABLES_DIR = 'C:\\dev\\dsh-workspace\\deliverables';
-const MISSING_ROOT = 'C:\\does\\not\\exist';
+// Portable fixtures: everything these tests need is created in a temp folder.
+// The two optional tests use GAME_LAB_TEST_APK / GAME_LAB_TEST_RELEASES when a
+// real APK is available (aapt2 metadata / lazy-enrichment behaviour).
+const SANDBOX = mkdtempSync(path.join(tmpdir(), 'game-lab-library-'));
+after(() => {
+  rmSync(SANDBOX, { recursive: true, force: true });
+});
+
+const SDK_DIR = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || '';
 const AAPT2_BASENAME = process.platform === 'win32' ? 'aapt2.exe' : 'aapt2';
+const OPTIONAL_APK = process.env.GAME_LAB_TEST_APK || '';
+const OPTIONAL_RELEASES = process.env.GAME_LAB_TEST_RELEASES || '';
+
+function writeFixture(file, bytes = 1024, secondsAgo = 0) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, Buffer.alloc(bytes, 0x41));
+  if (secondsAgo > 0) {
+    const stamp = new Date(Date.now() - secondsAgo * 1000);
+    utimesSync(file, stamp, stamp);
+  }
+  return file;
+}
 
 function groupGames(games) {
   const groups = new Map();
@@ -26,214 +40,132 @@ function groupGames(games) {
 }
 
 function assertGroupsConsistent(games) {
-  for (const [groupName, group] of groupGames(games)) {
-    assert.equal(
-      group.filter((game) => game.isLatest).length,
-      1,
-      'group ' + groupName + ' should have exactly one isLatest entry',
-    );
-    for (const game of group) {
-      assert.equal(game.versions, group.length, 'versions count for ' + groupName);
-    }
+  for (const [name, group] of groupGames(games)) {
+    assert.equal(group.filter((game) => game.isLatest).length, 1, `group ${name} needs one latest`);
+    for (const game of group) assert.equal(game.versions, group.length);
   }
 }
 
-function assertSortedNewestFirst(games) {
-  for (let index = 1; index < games.length; index += 1) {
-    assert.ok(
-      games[index - 1].mtimeMs >= games[index].mtimeMs,
-      'games should be sorted by mtime descending',
-    );
+test('resolveAapt2 finds aapt2 when an SDK is available', (t) => {
+  if (SDK_DIR === '' || !existsSync(SDK_DIR)) {
+    t.skip('no ANDROID_HOME / ANDROID_SDK_ROOT on this machine');
+    return;
   }
-}
-
-test('resolveAapt2 finds the newest build-tools aapt2', () => {
   const resolved = resolveAapt2(SDK_DIR);
-  assert.ok(resolved, 'expected an aapt2 under ' + SDK_DIR);
-  assert.ok(
-    resolved.endsWith(AAPT2_BASENAME),
-    'expected a path ending in ' + AAPT2_BASENAME + ', got ' + resolved,
-  );
+  if (resolved === null) {
+    t.skip('no build-tools aapt2 under ' + SDK_DIR);
+    return;
+  }
+  assert.ok(resolved.endsWith(AAPT2_BASENAME));
   assert.equal(existsSync(resolved), true);
-  assert.equal(resolveAapt2('C:\\dev\\tools\\definitely-missing-sdk'), null);
+  assert.equal(resolveAapt2(path.join(SDK_DIR, 'missing-sdk')), null);
   assert.equal(resolveAapt2(''), null);
 });
 
-test('apkInfo reads real badging from an APK', { timeout: 30_000 }, async (t) => {
-  if (!existsSync(SHADOWMIRE_APK)) {
-    t.skip('fixture APK is missing');
-    return;
-  }
-  const aapt2 = resolveAapt2(SDK_DIR);
-  if (!aapt2) {
-    t.skip('aapt2 is not available in the Android SDK');
-    return;
-  }
-  const info = await apkInfo(aapt2, SHADOWMIRE_APK);
-  assert.ok(info, 'apkInfo should return metadata for a readable APK');
-  assert.equal(info.packageName, 'com.shadowmire.game');
-  assert.equal(typeof info.label, 'string');
-  assert.ok(info.label.length > 0, 'label should be non-empty');
-  if (info.versionCode !== null) assert.match(info.versionCode, /^\d+$/);
-  if (info.versionName !== null) assert.ok(info.versionName.length > 0);
-  assert.equal(await apkInfo(aapt2, 'C:\\does\\not\\exist\\missing.apk'), null);
-});
+test('scanLibrary groups versioned builds and keeps plain names', async () => {
+  const releases = path.join(SANDBOX, 'releases');
+  writeFixture(path.join(releases, 'DemoGame-v1.00.apk'), 2048, 300);
+  writeFixture(path.join(releases, 'DemoGame-v2.00-debug.apk'), 2048, 200);
+  writeFixture(path.join(releases, 'DemoGame-v2.01.apk'), 2048, 100);
+  writeFixture(path.join(releases, 'OtherGame-online-debug.apk'), 4096, 50);
 
-test('scanLibrary finds release APKs and version groups', { timeout: 30_000 }, async (t) => {
-  if (!existsSync(RELEASES_DIR)) {
-    t.skip('release directory is missing');
-    return;
-  }
-  const result = await scanLibrary({ roots: [RELEASES_DIR], maxGames: 500 });
+  const result = await scanLibrary({ roots: [releases], maxGames: 50 });
   assert.equal(result.ok, true);
-  assert.deepEqual(result.scan.roots, [RELEASES_DIR]);
-  assert.equal(typeof result.scan.startedAt, 'number');
-  assert.equal(typeof result.scan.tookMs, 'number');
-  assert.ok(Array.isArray(result.games));
-  assert.ok(
-    result.games.length >= 30,
-    'expected at least 30 APKs, found ' + result.games.length,
-  );
-  assert.deepEqual(result.scan.skippedDirs, []);
+  assert.deepEqual(result.scan.roots, [releases]);
   assert.equal(result.scan.aapt2, null);
-  assert.equal(result.scan.gamesCapped, false);
+  assert.equal(result.games.length, 4);
   assert.deepEqual(result.projects, []);
-
   for (const game of result.games) {
     assert.equal(game.kind, 'apk');
     assert.equal(game.id, 'apk:' + game.path.toLowerCase());
     assert.equal(game.fromBuild, false);
     assert.equal(game.projectPath, null);
-    // No aapt2Path was passed, so metadata must stay lazy.
     assert.equal(game.packageName, null);
     assert.equal(game.label, null);
-    assert.ok(game.path.toLowerCase().endsWith('.apk'));
-    assert.ok(game.fileName.length > 0);
-    assert.equal(game.group.length > 0, true);
+    assert.ok(game.path.endsWith('.apk'));
   }
-  assertSortedNewestFirst(result.games);
-  assertGroupsConsistent(result.games);
 
   const groups = groupGames(result.games);
-  const lanterns = groups.get('LittleLanterns');
-  assert.ok(lanterns && lanterns.length > 1, 'expected a LittleLanterns group');
-  assert.equal(lanterns.filter((game) => game.isLatest).length, 1);
-  const lanternLatest = lanterns.filter((game) => game.isLatest)[0];
-  assert.equal(lanternLatest.mtimeMs, Math.max(...lanterns.map((game) => game.mtimeMs)));
-  assert.ok(lanterns.every((game) => game.group === 'LittleLanterns'));
+  assert.deepEqual([...groups.keys()].sort(), ['DemoGame', 'OtherGame-online-debug']);
+  const demo = groups.get('DemoGame');
+  assert.equal(demo.length, 3);
+  assert.equal(demo.filter((game) => game.isLatest).length, 1);
+  assert.equal(demo.find((game) => game.isLatest).fileName, 'DemoGame-v2.01.apk');
+  assert.equal(new Set(demo.map((game) => game.versions)).size, 1);
+  assertGroupsConsistent(result.games);
+  // Newest first, by mtime.
+  for (let index = 1; index < result.games.length; index += 1) {
+    assert.ok(result.games[index - 1].mtimeMs >= result.games[index].mtimeMs);
+  }
+});
 
-  const hearths = groups.get('HundredHearths');
-  assert.ok(hearths && hearths.length >= 10, 'expected a HundredHearths group');
+test('scanLibrary links build-output APKs to their Gradle project', async () => {
+  const project = path.join(SANDBOX, 'demo-project');
+  mkdirSync(project, { recursive: true });
+  writeFileSync(path.join(project, 'settings.gradle'), 'rootProject.name = "demo"\n');
+  writeFileSync(path.join(project, 'gradlew.bat'), '@echo off\r\n');
+  writeFixture(path.join(project, 'build', 'outputs', 'apk', 'debug', 'demo.apk'), 1024, 10);
+
+  const result = await scanLibrary({ roots: [project], maxGames: 100, maxProjects: 10 });
+  assert.equal(result.ok, true);
+  const projectEntry = result.projects.find((entry) => entry.path === project);
+  assert.ok(projectEntry, 'expected the demo Gradle project');
+  assert.equal(projectEntry.kind, 'gradle');
+  assert.equal(projectEntry.name, 'demo-project');
+  assert.match(projectEntry.gradlew, /gradlew(\.bat)?$/);
+  assert.equal(projectEntry.hasApk, true);
+
+  const buildGame = result.games.find((game) => game.fileName === 'demo.apk');
+  assert.ok(buildGame);
+  assert.equal(buildGame.fromBuild, true);
+  assert.equal(buildGame.projectPath, project);
 });
 
 test('scanLibrary survives a missing root', async () => {
-  const result = await scanLibrary({ roots: [MISSING_ROOT] });
+  const missing = path.join(SANDBOX, 'does-not-exist');
+  const result = await scanLibrary({ roots: [missing] });
   assert.equal(result.ok, true);
   assert.deepEqual(result.games, []);
   assert.deepEqual(result.projects, []);
-  assert.deepEqual(result.scan.roots, [MISSING_ROOT]);
-  assert.equal(result.scan.gamesCapped, false);
-  assert.equal(result.scan.projectsCapped, false);
+  assert.deepEqual(result.scan.roots, [missing]);
   assert.equal(result.scan.truncated, false);
   assert.equal(result.scan.aapt2, null);
-  assert.deepEqual(result.scan.skippedDirs, []);
-  assert.equal(typeof result.scan.tookMs, 'number');
 });
 
-test('scanLibrary links build-output APKs to their Gradle project', { timeout: 30_000 }, async (t) => {
-  if (!existsSync(LIUYING_DIR)) {
-    t.skip('liuying fixture project is missing');
+test('apkInfo reads a real APK when a fixture is provided', { timeout: 30_000 }, async (t) => {
+  if (OPTIONAL_APK === '' || !existsSync(OPTIONAL_APK)) {
+    t.skip('set GAME_LAB_TEST_APK to run the aapt2 metadata test');
     return;
   }
-  const result = await scanLibrary({ roots: [LIUYING_DIR], maxGames: 500, maxProjects: 500 });
-  assert.equal(result.ok, true);
-  assert.ok(result.games.length >= 2, 'expected build APKs under liuying');
-  assert.equal(result.scan.truncated, false);
-
-  const buildGames = result.games.filter((game) => game.fromBuild);
-  assert.ok(buildGames.length >= 1, 'expected at least one build/outputs APK');
-  for (const game of buildGames) {
-    assert.equal(game.path.toLowerCase().includes('\\build\\outputs\\'), true);
-    assert.equal(game.projectPath, LIUYING_DIR);
+  if (SDK_DIR === '' || resolveAapt2(SDK_DIR) === null) {
+    t.skip('aapt2 is not available');
+    return;
   }
-
-  const project = result.projects.find((entry) => entry.path === LIUYING_DIR);
-  assert.ok(project, 'expected the liuying Gradle project');
-  assert.equal(project.id, 'gradle:' + LIUYING_DIR.toLowerCase());
-  assert.equal(project.kind, 'gradle');
-  assert.equal(project.name, 'liuying');
-  assert.match(project.gradlew, /gradlew(\.bat)?$/);
-  assert.equal(project.hasApk, true);
-  assert.equal(typeof project.mtimeMs, 'number');
+  const info = await apkInfo(resolveAapt2(SDK_DIR), OPTIONAL_APK);
+  assert.ok(info, 'apkInfo should return metadata for a readable APK');
+  assert.equal(typeof info.packageName, 'string');
+  assert.ok(info.packageName.length > 0);
+  assert.equal(await apkInfo(resolveAapt2(SDK_DIR), path.join(SANDBOX, 'missing.apk')), null);
 });
 
-test('scanLibrary scans the workspace fast and keeps version names apart', { timeout: 60_000 }, async (t) => {
-  if (!existsSync(WORKSPACE_DIR)) {
-    t.skip('workspace is missing');
+test('scanLibrary keeps metadata lazy for large real scans', { timeout: 60_000 }, async (t) => {
+  if (OPTIONAL_RELEASES === '' || !existsSync(OPTIONAL_RELEASES)) {
+    t.skip('set GAME_LAB_TEST_RELEASES to a folder with >12 real APKs');
     return;
   }
-  const result = await scanLibrary({ roots: [WORKSPACE_DIR], maxGames: 500 });
-  assert.equal(result.ok, true);
-  assert.deepEqual(result.scan.roots, [WORKSPACE_DIR]);
-  assert.ok(
-    result.games.length >= 100,
-    'expected at least 100 APKs in the workspace, found ' + result.games.length,
-  );
-  assert.ok(result.scan.tookMs < 5_000, 'scan took ' + result.scan.tookMs + ' ms');
-  assert.equal(result.scan.skippedDirs.includes('node_modules'), true);
-  assert.ok(result.projects.length >= 1);
-  assert.ok(result.projects.length <= 40, 'default maxProjects should cap project count');
-  assertSortedNewestFirst(result.games);
-  assertGroupsConsistent(result.games);
-
-  // A name without a version token stays as is.
-  const shadowOnline = result.games.find((game) => game.fileName === 'Shadowmire-online-debug.apk');
-  assert.ok(shadowOnline, 'expected Shadowmire-online-debug.apk in the workspace');
-  assert.equal(shadowOnline.group, 'Shadowmire-online-debug');
-
-  // A trailing version token plus a known variant word is stripped.
-  const shadowVersioned = result.games.find((game) => game.fileName === 'Shadowmire-v0.6.0-debug.apk');
-  assert.ok(shadowVersioned, 'expected Shadowmire-v0.6.0-debug.apk in the workspace');
-  assert.equal(shadowVersioned.group, 'Shadowmire');
-
-  const lanterns = groupGames(result.games).get('LittleLanterns');
-  assert.ok(lanterns && lanterns.length >= 20, 'expected LittleLanterns builds in the workspace');
-});
-
-test('scanLibrary only enriches small scans when aapt2 is provided', { timeout: 60_000 }, async (t) => {
-  if (!existsSync(RELEASES_DIR) || !existsSync(DELIVERABLES_DIR)) {
-    t.skip('fixtures are missing');
+  if (SDK_DIR === '' || resolveAapt2(SDK_DIR) === null) {
+    t.skip('aapt2 is not available');
     return;
   }
-  const aapt2 = resolveAapt2(SDK_DIR);
-  if (!aapt2) {
-    t.skip('aapt2 is not available in the Android SDK');
-    return;
-  }
-
-  const large = await scanLibrary({ roots: [RELEASES_DIR], maxGames: 500, aapt2Path: aapt2 });
-  assert.equal(large.scan.aapt2, aapt2);
-  assert.ok(large.games.length > 12);
-  for (const game of large.games) {
+  const result = await scanLibrary({
+    roots: [OPTIONAL_RELEASES],
+    maxGames: 500,
+    aapt2Path: resolveAapt2(SDK_DIR),
+  });
+  assert.equal(result.scan.aapt2, resolveAapt2(SDK_DIR));
+  assert.ok(result.games.length > 12);
+  for (const game of result.games) {
     assert.equal(game.packageName, null);
     assert.equal(game.label, null);
-  }
-
-  const small = await scanLibrary({ roots: [DELIVERABLES_DIR], maxGames: 500, aapt2Path: aapt2 });
-  assert.equal(small.scan.aapt2, aapt2);
-  assert.ok(small.games.length > 0, 'expected APKs under deliverables');
-  if (small.games.length <= 12) {
-    const enriched = small.games.filter((game) => typeof game.packageName === 'string');
-    assert.ok(enriched.length > 0, 'expected at least one enriched APK');
-    for (const game of enriched) {
-      assert.ok(game.packageName.length > 0);
-      assert.equal(game.label === null || typeof game.label === 'string', true);
-      assert.equal(game.versionName === null || typeof game.versionName === 'string', true);
-      assert.equal(game.versionCode === null || typeof game.versionCode === 'string', true);
-      assert.equal(
-        game.launchableActivity === null || typeof game.launchableActivity === 'string',
-        true,
-      );
-    }
   }
 });

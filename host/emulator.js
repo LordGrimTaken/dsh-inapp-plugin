@@ -175,7 +175,7 @@ export function normalizeConfig(raw) {
   const home = os.homedir()
   if (!Array.isArray(config.gameRoots) || config.gameRoots.length === 0) {
     config.gameRoots = IS_WINDOWS
-      ? [path.join('C:', path.sep, 'dev', 'dsh-workspace'), path.join(home, 'Deliverables')]
+      ? [path.join('C:', path.sep, 'Games'), path.join(home, 'Games')]
       : [path.join(home, 'Games')]
   }
   config.gameRoots = config.gameRoots

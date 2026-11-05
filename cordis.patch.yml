@@ -11,6 +11,7 @@
         gpuMode: host
         idleMinutes: 5
         maxFps: 8
+        # Point these at the folders that contain your game APKs and Gradle /
+        # Capacitor projects. The values below are examples.
         gameRoots:
-          - C:\dev\dsh-workspace
-          - C:\Users\Austin\Deliverables
+          - C:\Games

@@ -18,7 +18,12 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "NOTES.md"
+    "NOTES.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "docs/*.md",
+    "assets/*"
   ],
   "dsh": {
     "bundle": {

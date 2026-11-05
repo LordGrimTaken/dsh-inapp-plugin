@@ -1,0 +1,20 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Local artifacts
+*.log
+*.tmp
+*.h264
+*.png.tmp
+coverage/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Keep plugin assets (explicitly un-ignore the shipped ones)
+!assets/*.png
+!assets/*.svg

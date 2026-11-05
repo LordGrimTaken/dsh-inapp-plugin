@@ -122,7 +122,7 @@ function findVersionSuffixIndex(stem) {
 
 // Derive a group name from an APK file name by stripping a trailing version
 // token plus (only) known variant words that follow it. A name without a
-// version token is returned unchanged, e.g. "Shadowmire-online-debug".
+// version token is returned unchanged, e.g. "DemoGame-online-debug".
 function deriveGroup(fileName) {
   const stem = fileName.replace(APK_SUFFIX_RE, '');
   if (stem.length === 0) return stem;

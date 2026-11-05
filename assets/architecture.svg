@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720" role="img" aria-label="Game Lab architecture">
+  <defs>
+    <style>
+      .bg { fill: #0f1720; }
+      .panel { fill: #16222e; stroke: #2b3d4f; stroke-width: 1.5; rx: 10; }
+      .client { fill: #12302a; stroke: #3ddc97; stroke-width: 2; rx: 10; }
+      .host { fill: #1a2433; stroke: #6ea8ff; stroke-width: 2; rx: 10; }
+      .mod { fill: #1f2c3b; stroke: #41617e; stroke-width: 1.3; rx: 8; }
+      .device { fill: #2a1f2f; stroke: #e58bff; stroke-width: 2; rx: 10; }
+      .t { fill: #e6edf3; font-family: Segoe UI, Arial, sans-serif; font-size: 15px; }
+      .h { fill: #ffffff; font-family: Segoe UI, Arial, sans-serif; font-size: 19px; font-weight: 600; }
+      .s { fill: #9fb0c0; font-family: Segoe UI, Arial, sans-serif; font-size: 12.5px; }
+      .mono { fill: #9fe8c4; font-family: Consolas, monospace; font-size: 12px; }
+      .arrow { stroke: #7d93a8; stroke-width: 2; fill: none; marker-end: url(#a); }
+      .arrow2 { stroke: #e58bff; stroke-width: 2; fill: none; marker-end: url(#a2); }
+    </style>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#7d93a8"/>
+    </marker>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#e58bff"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1200" height="720"/>
+  <text x="40" y="52" class="h" font-size="26">Game Lab - in-app Android emulator</text>
+  <text x="40" y="78" class="s">Host controller + Web UI page, joined only by loopback DSH webserver routes. The browser never talks to adb.</text>
+
+  <rect class="client" x="40" y="110" width="330" height="250"/>
+  <text x="60" y="142" class="h">DSH Web UI - client.js</text>
+  <text x="60" y="170" class="t">Game Lab page</text>
+  <text x="60" y="196" class="s">game library / Play / Build &amp; play</text>
+  <text x="60" y="220" class="s">Smooth canvas (WebCodecs) or PNG image</text>
+  <text x="60" y="244" class="s">tap, drag, keys, keyboard text</text>
+  <text x="60" y="268" class="s">status poll + 10 s heartbeat</text>
+  <text x="60" y="300" class="mono">/status /games /install /build</text>
+  <text x="60" y="322" class="mono">/input /heartbeat /frame.png</text>
+  <text x="60" y="344" class="mono">/stream /stream.h264</text>
+
+  <rect class="host" x="450" y="110" width="330" height="250"/>
+  <text x="470" y="142" class="h">host/routes.js</text>
+  <text x="470" y="170" class="s">loopback + same-origin fence</text>
+  <text x="470" y="194" class="s">JSON envelope, 64 KiB body cap</text>
+  <text x="470" y="218" class="s">one viewer per stream</text>
+  <text x="470" y="252" class="h">GameLab controller</text>
+  <text x="470" y="278" class="s">one emulator slot, state machine</text>
+  <text x="470" y="302" class="s">idle timer, build runner, adoption</text>
+  <text x="470" y="326" class="s">resource sampling (RAM / CPU)</text>
+
+  <rect class="mod" x="820" y="110" width="340" height="52"/>
+  <text x="838" y="134" class="t">host/frame.js</text>
+  <text x="838" y="153" class="s">adb exec-out screencap -p loop -> PNG splitter</text>
+  <rect class="mod" x="820" y="172" width="340" height="52"/>
+  <text x="838" y="196" class="t">host/video.js</text>
+  <text x="838" y="215" class="s">adb exec-out screenrecord -> Annex-B + NAL stats</text>
+  <rect class="mod" x="820" y="234" width="340" height="52"/>
+  <text x="838" y="258" class="t">host/library.js</text>
+  <text x="838" y="277" class="s">APK / Gradle project scan + aapt2 metadata</text>
+  <rect class="mod" x="820" y="296" width="340" height="52"/>
+  <text x="838" y="320" class="t">host/build.js</text>
+  <text x="838" y="339" class="s">Gradle vs Capacitor build plan + APK search</text>
+
+  <rect class="device" x="450" y="440" width="330" height="160"/>
+  <text x="470" y="472" class="h">adb -> headless AVD</text>
+  <text x="470" y="500" class="s">gamelab, 720x1280, 2 vCPU at most</text>
+  <text x="470" y="524" class="s">-no-window -no-snapshot -gpu host</text>
+  <text x="470" y="548" class="s">screen kept awake; display stays on</text>
+  <text x="470" y="576" class="mono">emulator-5554</text>
+
+  <path class="arrow" d="M370 235 H450"/>
+  <path class="arrow" d="M780 235 H820"/>
+  <path class="arrow" d="M900 350 V440"/>
+  <path class="arrow2" d="M615 350 V440"/>
+  <text x="628" y="400" class="s">adb</text>
+  <text x="390" y="228" class="s">same-origin HTTP</text>
+</svg>
